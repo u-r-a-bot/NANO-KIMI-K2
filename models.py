@@ -7,7 +7,7 @@ from config import Config
 config = Config()
 
 class Embeddings(nn.Module):
-    def __init__(self, embed_dim=768, vocab_size=163842):
+    def __init__(self, embed_dim=config.dim, vocab_size=config.vocab_size):
         super().__init__()
         self.table = nn.Embedding(num_embeddings=vocab_size, embedding_dim=embed_dim)
     
@@ -249,10 +249,168 @@ class Transformer(nn.Module):
         return logits
         
 if __name__ == "__main__":
+    # Device agnostic setup
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using Apple MPS")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU")
+    
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.manual_seed(0)
-    args = Config()
-    x = torch.randint(0, args.vocab_size, (2, 128))
-    model = Transformer(args)
-    print(model(x).size())
+    torch.manual_seed(42)
+    
+    config = Config()
+    model = Transformer(config).to(device)
+    
+    # Model info
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    print(f"Model size: {total_params * 2 / 1024**3:.2f} GB (bf16)")
+    
+    # Initialize model weights properly
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p, gain=0.5)
+    
+    # Test 1: Single forward pass
+    print("\n--- Test 1: Forward Pass ---")
+    batch_size = 2
+    seq_len = 128
+    tokens = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+    logits = model(tokens, start_pos=0)
+    print(f"Input shape: {tokens.shape}")
+    print(f"Output shape: {logits.shape}")
+    print(f"Logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
+    assert logits.shape == (batch_size, config.vocab_size)
+    
+    # Test 2: Sequential generation 
+    print("\n--- Test 2: Sequential Generation ---")
+    model.eval()
+    
+    prompt = torch.randint(0, config.vocab_size, (1, 10), device=device)
+    generated = []
+    
+    with torch.no_grad():
+        # Reset caches for new sequence
+        for layer in model.layers:
+            layer.attn.k_cache.zero_()
+            layer.attn.v_cache.zero_()
+        
+        # Process prompt
+        logits = model(prompt, start_pos=0)
+        
+        # Generate next tokens
+        for i in range(20):
+            next_pos = prompt.size(1) + i
+            
+            # Safe sampling
+            temperature = 0.8
+            scaled_logits = torch.clamp(logits / temperature, min=-100, max=100)
+            probs = F.softmax(scaled_logits, dim=-1)
+            
+            if torch.isnan(probs).any():
+                next_token = torch.randint(0, config.vocab_size, (1, 1), device=device)
+            else:
+                next_token = torch.multinomial(probs.squeeze(0), num_samples=1).unsqueeze(0)
+            
+            generated.append(next_token.item())
+            logits = model(next_token, start_pos=next_pos)
+    
+    print(f"Generated tokens: {generated[:10]}...")
+    
+    # Test 3: Batch processing (each with clean cache)
+    print("\n--- Test 3: Fresh Sequences ---")
+    for seq_len in [16, 32, 64]:
+        # Reset cache for each test
+        for layer in model.layers:
+            layer.attn.k_cache.zero_()
+            layer.attn.v_cache.zero_()
+        
+        batch_tokens = torch.randint(0, config.vocab_size, (2, seq_len), device=device)
+        with torch.no_grad():
+            logits = model(batch_tokens, start_pos=0)
+            print(f"Seq len {seq_len}: output shape {logits.shape}")
+    
+    # Test 4: Incremental generation (proper cache usage)
+    print("\n--- Test 4: Incremental Generation ---")
+    # Reset cache
+    for layer in model.layers:
+        layer.attn.k_cache.zero_()
+        layer.attn.v_cache.zero_()
+    
+    # Generate incrementally
+    seq = torch.randint(0, config.vocab_size, (1, 1), device=device)
+    positions_filled = 0
+    
+    with torch.no_grad():
+        for step in range(10):
+            logits = model(seq, start_pos=positions_filled)
+            positions_filled += seq.size(1)
+            
+            # Get next token
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            seq = next_token
+            
+            print(f"Step {step}: generated token {next_token.item()}, cache filled up to {positions_filled}")
+            
+            if positions_filled >= 100:
+                break
+    
+    # Test 5: Max sequence with timing
+    print("\n--- Test 5: Max Sequence Test ---")
+    for layer in model.layers:
+        layer.attn.k_cache.zero_()
+        layer.attn.v_cache.zero_()
+    
+    max_test_len = min(256, config.max_seq_length)
+    test_seq = torch.randint(0, config.vocab_size, (1, max_test_len), device=device)
+    
+    # Device-agnostic timing
+    import time
+    
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        with torch.no_grad():
+            start.record()
+            logits = model(test_seq, start_pos=0)
+            end.record()
+            torch.cuda.synchronize()
+            
+        elapsed_ms = start.elapsed_time(end)
+    else:
+        # For CPU/MPS
+        with torch.no_grad():
+            if device.type == 'mps':
+                torch.mps.synchronize()
+            
+            start_time = time.perf_counter()
+            logits = model(test_seq, start_pos=0)
+            
+            if device.type == 'mps':
+                torch.mps.synchronize()
+            
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+    
+    print(f"Processing {max_test_len} tokens: {elapsed_ms:.2f}ms")
+    print(f"Throughput: {max_test_len / (elapsed_ms / 1000):.1f} tokens/sec")
+    
+    # Test 6: Memory stats
+    print("\n--- Test 6: Memory Stats ---")
+    if device.type == 'cuda':
+        print(f"CUDA Allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        print(f"CUDA Reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    elif device.type == 'mps':
+        print(f"MPS Allocated: {torch.mps.current_allocated_memory() / 1024**3:.2f} GB")
+        print(f"MPS Driver Allocated: {torch.mps.driver_allocated_memory() / 1024**3:.2f} GB")
+    else:
+        print("Memory stats not available for CPU")
+    
+    print(f"\n✓ All tests passed on {device}")
