@@ -13,3 +13,5 @@ input.txt
 env/
 venv/
 /fineweb_cache
+*.pt
+*.pth
