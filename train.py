@@ -1,3 +1,4 @@
+import sys
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -584,6 +585,6 @@ def main():
         trainer.load_checkpoint(args.checkpoint_path)
     
     trainer.train()
-
+    sys.exit(0)
 if __name__ == "__main__":
     main()
