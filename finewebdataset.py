@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from tqdm import tqdm
 import pickle
 from pathlib import Path
-
+import sys
 class FineWebDataset(Dataset):
     def __init__(
         self,
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     sample_text = tokenizer.decode(batch['input_ids'][0][:50])
     print(f"\nSample text (first 50 tokens):")
     print(sample_text)
-    
+    sys.exit(0)
     # Training loop example
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # model = Transformer(config).to(device)
