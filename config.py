@@ -1,9 +1,23 @@
 from dataclasses import dataclass
 from typing import Literal
+from transformers import AutoTokenizer
+def get_vocab_size(tokenizer_name: str) -> int:
+    """
+    Loads a tokenizer from Hugging Face and returns its vocabulary size.
+
+    Args:
+        tokenizer_name (str): The name of the tokenizer on the Hugging Face Hub.
+
+    Returns:
+        int: The size of the tokenizer's vocabulary.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    return len(tokenizer)
 
 @dataclass
 class Config:
-    vocab_size: int = 49_152 # Original Kimi K2- 163,842, 
+    tokenizer_name:str = "HuggingFaceTB/SmolLM-135M"
+    vocab_size: int = get_vocab_size(tokenizer_name) if not None else 49152 # Original Kimi K2- 163,842, 
     dim: int = 768
     dropout: float = 0.1
     n_heads: int = 4
