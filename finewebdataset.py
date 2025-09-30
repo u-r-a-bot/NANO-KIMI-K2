@@ -80,7 +80,6 @@ class FineWebDataset(Dataset):
                 name=subset,
                 split="train",
                 streaming=True,
-                trust_remote_code=True
             )
             
             # Process samples
@@ -122,7 +121,6 @@ class FineWebDataset(Dataset):
                 "HuggingFaceFW/fineweb",
                 name=subset,
                 split=f"train[:{self.num_samples}]",
-                trust_remote_code=True
             )
             
             print(f"Tokenizing {len(dataset):,} texts...")
@@ -220,7 +218,6 @@ class FineWebStreamingDataset(torch.utils.data.IterableDataset):
             name=self.subset,
             split="train",
             streaming=True,
-            trust_remote_code=True
         )
         
         samples_yielded = 0

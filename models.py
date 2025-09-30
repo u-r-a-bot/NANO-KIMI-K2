@@ -88,7 +88,6 @@ class MLA(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, input_pos: Optional[torch.Tensor], mask: Optional[torch.Tensor]):
         b, seq_len, _ = x.size()
-        end_pos = start_pos + seq_len
         
         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
         k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim) 
@@ -102,18 +101,36 @@ class MLA(nn.Module):
 
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
+
+        # Differentiate between training and inference
+        if self.training:
+            # --- TRAINING LOGIC ---
+            # Don't use the cache. Compute attention on the current sequence.
+            scores = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
+
+            if mask is not None:
+                scores = scores + mask.unsqueeze(1)
+
+            weights = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+            c_v = torch.einsum("bsht,bthd->bshd", weights, v)
+        else:
+            # --- INFERENCE LOGIC ---
+            # Use the cache for autoregressive generation.
+            end_pos = start_pos + seq_len
+            self.k_cache[:b, start_pos:end_pos] = k
+            self.v_cache[:b, start_pos:end_pos] = v
+            
+            cached_k = self.k_cache[:b, :end_pos]
+            cached_v = self.v_cache[:b, :end_pos]
+            
+            scores = torch.einsum("bshd,bthd->bsht", q, cached_k) * self.softmax_scale
+
+            if mask is not None:
+                scores = scores + mask.unsqueeze(1)
+
+            weights = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+            c_v = torch.einsum("bsht,bthd->bshd", weights, cached_v)
         
-        self.k_cache[:b, start_pos:end_pos] = k
-        self.v_cache[:b, start_pos:end_pos] = v
-
-        scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:b, :end_pos]) * self.softmax_scale
-
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-
-        weights = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        
-        c_v = torch.einsum("bsht,bthd->bshd", weights, self.v_cache[:b, :end_pos])
         return self.c_v_linear(c_v.flatten(2))
         
 class MLP(nn.Module):
@@ -166,7 +183,7 @@ class Gate(nn.Module):
             topk_groups = self.topk // self.n_groups
             indices = group_scores.topk(topk_groups, dim=-1)[1]
             mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
+            scores = scores.masked_fill(mask.unsqueeze(-1), float("-inf")).flatten(1)
         
         indices = torch.topk(scores, self.topk, dim=-1)[1]
         weights = original_scores.gather(1, indices)
@@ -202,7 +219,7 @@ class MoE(nn.Module):
                 continue
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx]) * weights[idx, top, None]
+            y[idx] = y[idx]+ expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
         return (y + z).view(shape)
 

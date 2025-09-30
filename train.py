@@ -38,7 +38,7 @@ def forward_for_training(model, tokens, start_pos=0):
     
     mask = None
     if seqlen > 1:
-        mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu(1)
     
     for layer in model.layers:
         h = layer(h, start_pos, input_pos, mask)
@@ -94,7 +94,8 @@ class Trainer:
             eps=1e-8
         )
         
-        self.scaler = torch.cuda.amp.GradScaler() if mixed_precision and device == "cuda" else None
+        use_scaler = mixed_precision and torch.get_default_dtype() is not torch.bfloat16
+        self.scaler = torch.amp.GradScaler(enabled=use_scaler) if device == "cuda" else None
         
         self.global_step = 0
         self.best_loss = float('inf')
@@ -130,7 +131,7 @@ class Trainer:
         
         mask = None
         if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu(1)
         
         for layer in self.model.layers:
             h = layer(h, start_pos, input_pos, mask)
