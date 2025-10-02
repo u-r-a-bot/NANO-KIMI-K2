@@ -48,11 +48,13 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         mixed_precision: bool = True,
+        dtype: torch.dtype = torch.float32,
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = torch.device(device)
+        self.dtype = dtype
         self.model.to(self.device)
         
         self.learning_rate = learning_rate
@@ -78,7 +80,8 @@ class Trainer:
         )
         
         self.mixed_precision = mixed_precision and device == "cuda"
-        self.scaler = torch.amp.GradScaler(enabled=self.mixed_precision,device=device ) if self.mixed_precision else None
+        self.use_scaler = self.mixed_precision and dtype == torch.float16
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_scaler else None
         
         self.global_step = 0
         self.best_loss = float('inf')
@@ -119,7 +122,7 @@ class Trainer:
             labels = batch['labels'].to(self.device)
             attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
             
-            with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
+            with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=self.dtype):
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
                 
                 loss = F.cross_entropy(
@@ -220,8 +223,10 @@ class Trainer:
             f"Model: {self.model.__class__.__name__}\n"
             f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}\n"
             f"Device: {self.device}\n"
+            f"Dtype: {self.dtype}\n"
             f"Max Steps: {self.max_steps:,}\n"
             f"Mixed Precision: {self.mixed_precision}\n"
+            f"Gradient Scaler: {self.use_scaler}\n"
             f"Gradient Accumulation: {self.gradient_accumulation_steps}",
             title="Nano KIMI K2 Training",
             border_style="cyan"
@@ -259,7 +264,7 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
                 
-                with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
+                with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=self.dtype):
                     logits = self.model(input_ids, start_pos=0, use_cache=False)
                     
                     loss = F.cross_entropy(
@@ -499,8 +504,10 @@ def main():
     
     model = Transformer(config)
     
+    dtype = torch.float32
     if args.device == 'cuda':
-        model = model.to(dtype=torch.bfloat16)
+        dtype = torch.bfloat16
+        model = model.to(dtype=dtype)
         console.print("[green]Using bfloat16 precision on CUDA[/green]")
     elif args.device == 'mps':
         model = model.to(dtype=torch.float32)
@@ -530,7 +537,8 @@ def main():
         device=args.device,
         gradient_accumulation_steps=args.gradient_accumulation,
         max_grad_norm=args.max_grad_norm,
-        mixed_precision=args.mixed_precision
+        mixed_precision=args.mixed_precision,
+        dtype=dtype
     )
     
     if args.resume:

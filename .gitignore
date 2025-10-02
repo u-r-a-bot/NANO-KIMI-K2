@@ -15,3 +15,4 @@ venv/
 /fineweb_cache
 *.pt
 *.pth
+app.py
