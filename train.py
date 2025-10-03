@@ -92,8 +92,9 @@ class Trainer:
             qk_clip_enabled=True
         )
         
-        self.scaler = torch.cuda.amp.GradScaler() if mixed_precision and device == 'cuda' else None
+        self.scaler = torch.amp.GradScaler('cuda') if mixed_precision and device == 'cuda' and dtype == torch.float16 else None
         self.mixed_precision = mixed_precision
+        self.use_amp = mixed_precision and device == 'cuda'
         
         self.global_step = 0
         self.epoch = 0
@@ -192,7 +193,7 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
+            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
                 loss = F.cross_entropy(
                     logits.reshape(-1, self.model.vocab_size),
@@ -214,51 +215,42 @@ class Trainer:
             return
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Training Metrics', fontsize=16)
         
-        steps = self.metrics['steps']
-        
-        axes[0, 0].plot(steps, self.metrics['train_loss'], label='Train Loss', color='blue')
-        if self.metrics['val_loss']:
-            val_steps = [s for i, s in enumerate(steps) if i < len(self.metrics['val_loss'])]
-            axes[0, 0].plot(val_steps, self.metrics['val_loss'], label='Val Loss', color='red')
+        axes[0, 0].plot(self.metrics['steps'], self.metrics['train_loss'])
         axes[0, 0].set_xlabel('Steps')
-        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_ylabel('Train Loss')
         axes[0, 0].set_title('Training Loss')
-        axes[0, 0].legend()
         axes[0, 0].grid(True)
         
-        axes[0, 1].plot(steps, self.metrics['learning_rate'], color='green')
-        axes[0, 1].set_xlabel('Steps')
-        axes[0, 1].set_ylabel('Learning Rate')
-        axes[0, 1].set_title('Learning Rate Schedule')
-        axes[0, 1].grid(True)
+        if self.metrics['val_loss']:
+            val_steps = [self.metrics['steps'][i] for i in range(0, len(self.metrics['val_loss']))]
+            axes[0, 1].plot(val_steps, self.metrics['val_loss'])
+            axes[0, 1].set_xlabel('Steps')
+            axes[0, 1].set_ylabel('Validation Loss')
+            axes[0, 1].set_title('Validation Loss')
+            axes[0, 1].grid(True)
         
-        axes[1, 0].plot(steps, self.metrics['grad_norm'], color='orange')
+        axes[1, 0].plot(self.metrics['steps'], self.metrics['learning_rate'])
         axes[1, 0].set_xlabel('Steps')
-        axes[1, 0].set_ylabel('Gradient Norm')
-        axes[1, 0].set_title('Gradient Norm')
+        axes[1, 0].set_ylabel('Learning Rate')
+        axes[1, 0].set_title('Learning Rate Schedule')
         axes[1, 0].grid(True)
         
-        if self.metrics['max_logits']:
-            axes[1, 1].plot(steps, self.metrics['max_logits'], color='purple')
-            axes[1, 1].axhline(y=self.qk_clip_tau, color='r', linestyle='--', label=f'Clip Threshold ({self.qk_clip_tau})')
-            axes[1, 1].set_xlabel('Steps')
-            axes[1, 1].set_ylabel('Max Logits')
-            axes[1, 1].set_title('Max Logits (QK-Clip)')
-            axes[1, 1].legend()
-            axes[1, 1].grid(True)
+        axes[1, 1].plot(self.metrics['steps'], self.metrics['grad_norm'])
+        axes[1, 1].set_xlabel('Steps')
+        axes[1, 1].set_ylabel('Gradient Norm')
+        axes[1, 1].set_title('Gradient Norm')
+        axes[1, 1].grid(True)
         
         plt.tight_layout()
-        plt.savefig(self.log_dir / 'training_metrics.png', dpi=150)
+        plt.savefig(self.log_dir / 'training_metrics.png')
         plt.close()
     
     def train(self):
         self.model.train()
-        self.start_time = time.time()
         
-        console.print(Panel.fit(
-            f"[bold cyan]Starting Training[/bold cyan]\n"
+        panel = Panel.fit(
+            f"[bold green]Starting Training[/bold green]\n"
             f"Max Steps: {self.max_steps:,}\n"
             f"Batch Size: {self.train_loader.batch_size}\n"
             f"Learning Rate: {self.learning_rate}\n"
@@ -268,8 +260,9 @@ class Trainer:
             f"Gradient Accumulation: {self.gradient_accumulation_steps}\n"
             f"Device: {self.device}",
             title="Training Configuration",
-            border_style="cyan"
-        ))
+            border_style="green"
+        )
+        console.print(panel)
         
         accumulated_loss = 0
         accumulation_counter = 0
@@ -299,7 +292,7 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
                 
-                with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
+                with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
                     logits = self.model(input_ids, start_pos=0, use_cache=False)
                     
                     loss = F.cross_entropy(
@@ -442,75 +435,40 @@ def main():
     
     console.print("[yellow]Preparing dataset...[/yellow]")
     
-    try:
-        if args.dataset == 'streaming':
-            dataset = FineWebStreamingDataset(
-                tokenizer=tokenizer,
-                max_length=config.max_seq_length,
-                num_samples=args.num_samples
-            )
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                num_workers=0,
-                pin_memory=torch.cuda.is_available()
-            )
-        elif args.dataset == 'fineweb':
-            dataset = FineWebDataset(
-                tokenizer=tokenizer,
-                max_length=config.max_seq_length,
-                split='train',
-                num_samples=args.num_samples
-            )
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=2 if args.device == 'cuda' else 0,
-                pin_memory=torch.cuda.is_available(),
-                collate_fn=DataCollator(tokenizer.pad_token_id),
-                drop_last=True
-            )
-        else:
-            if not Path(args.data_path).exists():
-                console.print("[yellow]Creating sample data...[/yellow]")
-                Path("data").mkdir(exist_ok=True)
-                sample_text = """
-                This is a sample training text for our model.
-                Machine learning is transforming the world in unprecedented ways.
-                Natural language processing enables computers to understand human language.
-                Deep learning models have revolutionized artificial intelligence.
-                Transformers architecture has become the foundation of modern NLP.
-                Attention mechanisms allow models to focus on relevant information.
-                Training neural networks requires careful optimization and tuning.
-                """ * 500
-                Path(args.data_path).write_text(sample_text)
-            
-            dataset = TextDataset(
-                file_path=args.data_path,
-                tokenizer=tokenizer,
-                max_length=config.max_seq_length,
-                stride=512,
-                min_length=32,
-                combine_short=True,
-                cache_tokens=True
-            )
-            dataloader = DataLoader(
-                dataset,
-                batch_size=args.batch_size,
-                shuffle=True,
-                num_workers=2 if args.device == 'cuda' else 0,
-                pin_memory=torch.cuda.is_available(),
-                collate_fn=DataCollator(tokenizer.pad_token_id),
-                drop_last=True
-            )
-    except Exception as e:
-        console.print(f"[red]Error loading dataset: {e}[/red]")
-        console.print("[yellow]Creating fallback dataset...[/yellow]")
-        Path("data").mkdir(exist_ok=True)
-        sample_path = Path("data/fallback.txt")
-        sample_text = "This is sample training data. " * 5000
-        sample_path.write_text(sample_text)
+    if args.dataset == 'fineweb':
+        dataset = FineWebDataset(
+            tokenizer=tokenizer,
+            num_samples=args.num_samples,
+            max_length=config.max_seq_length
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=DataCollator(tokenizer.pad_token_id),
+            drop_last=True
+        )
+    elif args.dataset == 'streaming':
+        dataset = FineWebStreamingDataset(
+            tokenizer=tokenizer,
+            max_length=config.max_seq_length
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            num_workers=0,
+            collate_fn=DataCollator(tokenizer.pad_token_id),
+            drop_last=True
+        )
+    else:
+        data_path = Path(args.data_path)
+        if not data_path.exists():
+            console.print(f"[yellow]Data file not found, creating sample dataset...[/yellow]")
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            sample_path = data_path.parent / 'sample_train.txt'
+            sample_text = "The quick brown fox jumps over the lazy dog. " * 5000
+            sample_path.write_text(sample_text)
         
         dataset = TextDataset(
             file_path=sample_path,
