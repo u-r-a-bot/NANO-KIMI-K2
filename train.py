@@ -27,6 +27,7 @@ from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
 from dataset import TextDataset, DataCollator
+from optimizer import MuonClip, get_muon_param_groups
 
 console = Console()
 
@@ -36,7 +37,8 @@ class Trainer:
         model: torch.nn.Module,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 0.02,
+        momentum: float = 0.95,
         weight_decay: float = 0.01,
         warmup_steps: int = 500,
         max_steps: int = 10000,
@@ -49,6 +51,7 @@ class Trainer:
         max_grad_norm: float = 1.0,
         mixed_precision: bool = True,
         dtype: torch.dtype = torch.float32,
+        qk_clip_tau: float = 100.0
     ):
         self.model = model
         self.train_loader = train_loader
@@ -58,6 +61,7 @@ class Trainer:
         self.model.to(self.device)
         
         self.learning_rate = learning_rate
+        self.momentum = momentum
         self.weight_decay = weight_decay
         self.warmup_steps = warmup_steps
         self.max_steps = max_steps
@@ -65,177 +69,210 @@ class Trainer:
         self.save_interval = save_interval
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
+        self.qk_clip_tau = qk_clip_tau
         
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(exist_ok=True)
         
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.95),
-            eps=1e-8
+        param_groups = get_muon_param_groups(
+            self.model,
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
         )
         
-        self.mixed_precision = mixed_precision and device == "cuda"
-        self.use_scaler = self.mixed_precision and dtype == torch.float16
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_scaler else None
+        self.optimizer = MuonClip(
+            param_groups,
+            lr=self.learning_rate,
+            momentum=self.momentum,
+            nesterov=True,
+            weight_decay=self.weight_decay,
+            qk_clip_tau=self.qk_clip_tau,
+            qk_clip_enabled=True
+        )
+        
+        self.scaler = torch.cuda.amp.GradScaler() if mixed_precision and device == 'cuda' else None
+        self.mixed_precision = mixed_precision
         
         self.global_step = 0
+        self.epoch = 0
         self.best_loss = float('inf')
+        self.start_time = time.time()
+        
         self.metrics = {
             'train_loss': [],
             'val_loss': [],
             'learning_rate': [],
-            'gradient_norm': [],
+            'grad_norm': [],
+            'max_logits': [],
             'steps': []
         }
-        
-        self.start_time = time.time()
-        
-    def get_lr(self):
-        if self.global_step < self.warmup_steps:
-            return self.learning_rate * (self.global_step + 1) / self.warmup_steps
-        else:
-            progress = (self.global_step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps)
-            return self.learning_rate * (0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress)))
     
     def update_lr(self):
-        lr = self.get_lr()
+        if self.global_step < self.warmup_steps:
+            lr = self.learning_rate * (self.global_step + 1) / self.warmup_steps
+        else:
+            progress = (self.global_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            lr = self.learning_rate * 0.5 * (1 + np.cos(np.pi * progress))
+        
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+        
         return lr
     
-    @torch.no_grad()
-    def evaluate(self, num_batches: int = 10):
-        self.model.eval()
-        losses = []
-        
-        eval_loader = self.val_loader or self.train_loader
-        for i, batch in enumerate(eval_loader):
-            if i >= num_batches:
-                break
-                
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
-            
-            with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=self.dtype):
-                logits = self.model(input_ids, start_pos=0, use_cache=False)
-                
-                loss = F.cross_entropy(
-                    logits.reshape(-1, self.model.vocab_size),
-                    labels.reshape(-1),
-                    ignore_index=0,
-                    reduction='none'
-                )
-                masked_loss = loss * attention_mask.reshape(-1)
-                loss = masked_loss.sum() / attention_mask.sum().clamp(min=1)
-            
-            losses.append(loss.item())
-        
-        self.model.train()
-        return np.mean(losses) if losses else float('inf')
+    def compute_max_logits(self, logits):
+        with torch.no_grad():
+            max_logit = logits.abs().max().item()
+        return max_logit
     
-    def save_checkpoint(self, is_best: bool = False):
+    def save_checkpoint(self, filename: Optional[str] = None):
+        if filename is None:
+            filename = f'checkpoint_step_{self.global_step}.pt'
+        
+        checkpoint_path = self.checkpoint_dir / filename
+        
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'global_step': self.global_step,
+            'epoch': self.epoch,
             'best_loss': self.best_loss,
-            'metrics': self.metrics,
+            'metrics': self.metrics
         }
         
-        if self.scaler is not None:
+        if self.scaler:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
-        latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
-        torch.save(checkpoint, latest_path)
+        torch.save(checkpoint, checkpoint_path)
+        console.print(f"[green]Saved checkpoint: {checkpoint_path}[/green]")
         
-        if is_best:
-            best_path = self.checkpoint_dir / "checkpoint_best.pt"
-            torch.save(checkpoint, best_path)
-            console.print(f"[green]✓ Saved best checkpoint (loss: {self.best_loss:.4f})[/green]")
+        return checkpoint_path
     
     def load_checkpoint(self, checkpoint_path: Optional[str] = None):
         if checkpoint_path is None:
-            checkpoint_path = self.checkpoint_dir / "checkpoint_latest.pt"
+            checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_step_*.pt'))
+            if not checkpoints:
+                return False
+            checkpoint_path = checkpoints[-1]
+        else:
+            checkpoint_path = Path(checkpoint_path)
         
-        if not Path(checkpoint_path).exists():
+        if not checkpoint_path.exists():
+            console.print(f"[yellow]Checkpoint not found: {checkpoint_path}[/yellow]")
             return False
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
+        self.epoch = checkpoint['epoch']
         self.best_loss = checkpoint['best_loss']
         self.metrics = checkpoint['metrics']
         
-        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+        if self.scaler and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
-        console.print(f"[cyan]Resumed from step {self.global_step}[/cyan]")
+        console.print(f"[green]Loaded checkpoint: {checkpoint_path}[/green]")
+        console.print(f"[cyan]Resuming from step {self.global_step}[/cyan]")
+        
         return True
     
+    @torch.no_grad()
+    def evaluate(self):
+        if self.val_loader is None:
+            return 0.0
+        
+        self.model.eval()
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in self.val_loader:
+            input_ids = batch['input_ids'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
+                logits = self.model(input_ids, start_pos=0, use_cache=False)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, self.model.vocab_size),
+                    labels.reshape(-1),
+                    ignore_index=0
+                )
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            if num_batches >= 10:
+                break
+        
+        self.model.train()
+        return total_loss / max(num_batches, 1)
+    
     def plot_metrics(self):
-        if len(self.metrics['steps']) < 2:
+        if not self.metrics['steps']:
             return
         
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
-        fig.suptitle(f'Training Metrics - Step {self.global_step}', fontsize=14)
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('Training Metrics', fontsize=16)
         
-        ax1.plot(self.metrics['steps'], self.metrics['train_loss'], 'b-', label='Train Loss')
+        steps = self.metrics['steps']
+        
+        axes[0, 0].plot(steps, self.metrics['train_loss'], label='Train Loss', color='blue')
         if self.metrics['val_loss']:
-            val_steps = self.metrics['steps'][::self.eval_interval] if self.eval_interval > 0 else self.metrics['steps']
-            val_steps = val_steps[:len(self.metrics['val_loss'])]
-            ax1.plot(val_steps, self.metrics['val_loss'], 'r-', label='Val Loss', marker='o', markersize=3)
-        ax1.set_xlabel('Steps')
-        ax1.set_ylabel('Loss')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+            val_steps = [s for i, s in enumerate(steps) if i < len(self.metrics['val_loss'])]
+            axes[0, 0].plot(val_steps, self.metrics['val_loss'], label='Val Loss', color='red')
+        axes[0, 0].set_xlabel('Steps')
+        axes[0, 0].set_ylabel('Loss')
+        axes[0, 0].set_title('Training Loss')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True)
         
-        ax2.plot(self.metrics['steps'], self.metrics['learning_rate'], 'g-')
-        ax2.set_xlabel('Steps')
-        ax2.set_ylabel('Learning Rate')
-        ax2.grid(True, alpha=0.3)
+        axes[0, 1].plot(steps, self.metrics['learning_rate'], color='green')
+        axes[0, 1].set_xlabel('Steps')
+        axes[0, 1].set_ylabel('Learning Rate')
+        axes[0, 1].set_title('Learning Rate Schedule')
+        axes[0, 1].grid(True)
         
-        ax3.plot(self.metrics['steps'], self.metrics['gradient_norm'], 'orange')
-        ax3.set_xlabel('Steps')
-        ax3.set_ylabel('Gradient Norm')
-        ax3.grid(True, alpha=0.3)
+        axes[1, 0].plot(steps, self.metrics['grad_norm'], color='orange')
+        axes[1, 0].set_xlabel('Steps')
+        axes[1, 0].set_ylabel('Gradient Norm')
+        axes[1, 0].set_title('Gradient Norm')
+        axes[1, 0].grid(True)
         
-        elapsed_per_step = (time.time() - self.start_time) / max(1, self.global_step)
-        throughput = [1.0 / elapsed_per_step for _ in self.metrics['steps']]
-        ax4.plot(self.metrics['steps'], throughput, 'purple')
-        ax4.set_xlabel('Steps')
-        ax4.set_ylabel('Steps/sec')
-        ax4.grid(True, alpha=0.3)
+        if self.metrics['max_logits']:
+            axes[1, 1].plot(steps, self.metrics['max_logits'], color='purple')
+            axes[1, 1].axhline(y=self.qk_clip_tau, color='r', linestyle='--', label=f'Clip Threshold ({self.qk_clip_tau})')
+            axes[1, 1].set_xlabel('Steps')
+            axes[1, 1].set_ylabel('Max Logits')
+            axes[1, 1].set_title('Max Logits (QK-Clip)')
+            axes[1, 1].legend()
+            axes[1, 1].grid(True)
         
         plt.tight_layout()
-        plt.savefig(self.log_dir / 'training_metrics.png', dpi=100, bbox_inches='tight')
+        plt.savefig(self.log_dir / 'training_metrics.png', dpi=150)
         plt.close()
     
     def train(self):
+        self.model.train()
+        self.start_time = time.time()
+        
         console.print(Panel.fit(
             f"[bold cyan]Starting Training[/bold cyan]\n"
-            f"Model: {self.model.__class__.__name__}\n"
-            f"Parameters: {sum(p.numel() for p in self.model.parameters()):,}\n"
-            f"Device: {self.device}\n"
-            f"Dtype: {self.dtype}\n"
             f"Max Steps: {self.max_steps:,}\n"
-            f"Mixed Precision: {self.mixed_precision}\n"
-            f"Gradient Scaler: {self.use_scaler}\n"
-            f"Gradient Accumulation: {self.gradient_accumulation_steps}",
-            title="Nano KIMI K2 Training",
+            f"Batch Size: {self.train_loader.batch_size}\n"
+            f"Learning Rate: {self.learning_rate}\n"
+            f"Momentum: {self.momentum}\n"
+            f"Weight Decay: {self.weight_decay}\n"
+            f"QK-Clip Tau: {self.qk_clip_tau}\n"
+            f"Gradient Accumulation: {self.gradient_accumulation_steps}\n"
+            f"Device: {self.device}",
+            title="Training Configuration",
             border_style="cyan"
         ))
         
-        self.model.train()
-        accumulation_counter = 0
         accumulated_loss = 0
-        step_start_time = time.time()
+        accumulation_counter = 0
         
         with Progress(
             SpinnerColumn(),
@@ -244,10 +281,8 @@ class Trainer:
             TaskProgressColumn(),
             TimeElapsedColumn(),
             TimeRemainingColumn(),
-            console=console,
-            refresh_per_second=2
+            console=console
         ) as progress:
-            
             train_task = progress.add_task("[cyan]Training...", total=self.max_steps)
             progress.update(train_task, completed=self.global_step)
             
@@ -264,7 +299,7 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
                 
-                with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=self.dtype):
+                with torch.cuda.amp.autocast(enabled=self.mixed_precision, dtype=torch.bfloat16 if self.mixed_precision else torch.float32):
                     logits = self.model(input_ids, start_pos=0, use_cache=False)
                     
                     loss = F.cross_entropy(
@@ -276,6 +311,8 @@ class Trainer:
                     masked_loss = loss * attention_mask.reshape(-1)
                     loss = masked_loss.sum() / attention_mask.sum().clamp(min=1)
                     loss = loss / self.gradient_accumulation_steps
+                
+                max_logits = self.compute_max_logits(logits)
                 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
@@ -297,54 +334,51 @@ class Trainer:
                     lr = self.update_lr()
                     
                     if self.scaler:
-                        self.scaler.step(self.optimizer)
+                        self.scaler.step(self.optimizer, max_logits=max_logits)
                         self.scaler.update()
                     else:
-                        self.optimizer.step()
+                        self.optimizer.step(max_logits=max_logits)
                     
-                    self.optimizer.zero_grad(set_to_none=True)
+                    self.optimizer.zero_grad()
                     
-                    self.global_step += 1
-                    train_loss = accumulated_loss * self.gradient_accumulation_steps
-                    
-                    self.metrics['train_loss'].append(train_loss)
+                    self.metrics['train_loss'].append(accumulated_loss)
                     self.metrics['learning_rate'].append(lr)
-                    self.metrics['gradient_norm'].append(grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm)
+                    self.metrics['grad_norm'].append(grad_norm.item())
+                    self.metrics['max_logits'].append(max_logits)
                     self.metrics['steps'].append(self.global_step)
-                    
-                    throughput = 1.0 / (time.time() - step_start_time)
-                    step_start_time = time.time()
                     
                     progress.update(train_task, advance=1)
                     
                     if self.global_step % 10 == 0:
-                        progress.update(
-                            train_task,
-                            description=f"[cyan]Step {self.global_step}: Loss={train_loss:.4f} LR={lr:.6f} Grad={grad_norm:.3f}"
+                        progress.console.print(
+                            f"[cyan]Step {self.global_step}/{self.max_steps}[/cyan] | "
+                            f"Loss: {accumulated_loss:.4f} | "
+                            f"LR: {lr:.6f} | "
+                            f"Grad: {grad_norm:.4f} | "
+                            f"MaxLogits: {max_logits:.2f}"
                         )
-                    
-                    if self.global_step % self.eval_interval == 0:
-                        val_loss = self.evaluate()
-                        self.metrics['val_loss'].append(val_loss)
-                        
-                        is_best = val_loss < self.best_loss
-                        if is_best:
-                            self.best_loss = val_loss
-                        
-                        console.print(f"\n[yellow]Step {self.global_step}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, LR={lr:.6f}, Best={self.best_loss:.4f}[/yellow]")
-                        
-                        if is_best:
-                            self.save_checkpoint(is_best=True)
-                    
-                    if self.global_step % self.save_interval == 0:
-                        self.save_checkpoint()
-                        self.plot_metrics()
-                        console.print(f"[blue]Checkpoint saved at step {self.global_step}[/blue]")
                     
                     accumulated_loss = 0
                     accumulation_counter = 0
+                    self.global_step += 1
+                    
+                    if self.global_step % self.eval_interval == 0 and self.val_loader:
+                        val_loss = self.evaluate()
+                        self.metrics['val_loss'].append(val_loss)
+                        console.print(f"[yellow]Validation Loss: {val_loss:.4f}[/yellow]")
+                        
+                        if val_loss < self.best_loss:
+                            self.best_loss = val_loss
+                            self.save_checkpoint('best_model.pt')
+                    
+                    if self.global_step % self.save_interval == 0:
+                        self.save_checkpoint()
+                    
+                    if self.global_step >= self.max_steps:
+                        break
         
-        final_val_loss = self.evaluate()
+        final_val_loss = self.evaluate() if self.val_loader else 0.0
+        
         console.print(Panel.fit(
             f"[bold green]Training Complete![/bold green]\n"
             f"Total Steps: {self.global_step:,}\n"
@@ -362,13 +396,15 @@ class Trainer:
             json.dump(self.metrics, f, indent=2)
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model')
+    parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
     parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local'])
     parser.add_argument('--data_path', type=str, default='data/train.txt')
     parser.add_argument('--num_samples', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--learning_rate', type=float, default=5e-5)
+    parser.add_argument('--learning_rate', type=float, default=0.02)
+    parser.add_argument('--momentum', type=float, default=0.95)
     parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--qk_clip_tau', type=float, default=100.0)
     parser.add_argument('--max_steps', type=int, default=500)
     parser.add_argument('--eval_interval', type=int, default=25)
     parser.add_argument('--save_interval', type=int, default=100)
@@ -411,8 +447,7 @@ def main():
             dataset = FineWebStreamingDataset(
                 tokenizer=tokenizer,
                 max_length=config.max_seq_length,
-                num_samples=args.num_samples,
-                subset="sample-10BT"
+                num_samples=args.num_samples
             )
             dataloader = DataLoader(
                 dataset,
@@ -424,26 +459,24 @@ def main():
             dataset = FineWebDataset(
                 tokenizer=tokenizer,
                 max_length=config.max_seq_length,
-                num_samples=args.num_samples,
-                cache_dir="./fineweb_cache",
-                streaming=True,
-                min_length=100,
-                rebuild_cache=False
+                split='train',
+                num_samples=args.num_samples
             )
             dataloader = DataLoader(
                 dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
-                num_workers=4 if args.device == 'cuda' else 0,
+                num_workers=2 if args.device == 'cuda' else 0,
                 pin_memory=torch.cuda.is_available(),
+                collate_fn=DataCollator(tokenizer.pad_token_id),
                 drop_last=True
             )
         else:
             if not Path(args.data_path).exists():
-                console.print(f"[yellow]Data file not found, creating sample data...[/yellow]")
+                console.print("[yellow]Creating sample data...[/yellow]")
                 Path("data").mkdir(exist_ok=True)
                 sample_text = """
-                The quick brown fox jumps over the lazy dog. This is a sample training text for our model.
+                This is a sample training text for our model.
                 Machine learning is transforming the world in unprecedented ways.
                 Natural language processing enables computers to understand human language.
                 Deep learning models have revolutionized artificial intelligence.
@@ -527,6 +560,7 @@ def main():
         train_loader=dataloader,
         val_loader=None,
         learning_rate=args.learning_rate,
+        momentum=args.momentum,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
         max_steps=args.max_steps,
@@ -538,7 +572,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         max_grad_norm=args.max_grad_norm,
         mixed_precision=args.mixed_precision,
-        dtype=dtype
+        dtype=dtype,
+        qk_clip_tau=args.qk_clip_tau
     )
     
     if args.resume:
