@@ -486,13 +486,13 @@ def main():
     dtype = torch.float32
     if args.mixed_precision and args.device == 'cuda':
         dtype = torch.float16
-        model = model.to(dtype=torch.float16)
+        model = model
         console.print("[green]Using float16 precision on CUDA[/green]")
     elif args.device == 'mps':
-        model = model.to(dtype=torch.float32)
+        model = model
         console.print("[green]Using float32 precision on MPS[/green]")
     else:
-        model = model.to(dtype=torch.float32)
+        model = model
         console.print("[green]Using float32 precision on CPU[/green]")
     
     total_params = sum(p.numel() for p in model.parameters())
