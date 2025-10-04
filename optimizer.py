@@ -108,16 +108,8 @@ class MuonClip(Optimizer):
                     if max_logits > qk_clip_tau:
                         gamma = qk_clip_tau / max_logits
                         gamma_sqrt = math.sqrt(gamma)
-                        
-                        if 'qc' in group.get('param_name', '').lower() or 'kc' in group.get('param_name', '').lower():
-                            p.mul_(gamma_sqrt)
-                            update = update * gamma_sqrt
-                        elif 'qr' in group.get('param_name', '').lower():
-                            p.mul_(gamma)
-                            update = update * gamma
-                        else:
-                            p.mul_(gamma_sqrt)
-                            update = update * gamma_sqrt
+                        p.mul_(gamma_sqrt)
+                        update = update * gamma_sqrt
                 
                 p.add_(update, alpha=-lr)
         
@@ -144,13 +136,10 @@ class MuonClip(Optimizer):
 def get_muon_param_groups(model, lr=0.02, weight_decay=0.01):
     qk_params = []
     other_params = []
-    param_names = {}
     
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        
-        param_names[id(param)] = name
         
         if any(x in name.lower() for x in ['wq', 'wk', 'q_proj', 'k_proj']):
             qk_params.append(param)
@@ -162,8 +151,7 @@ def get_muon_param_groups(model, lr=0.02, weight_decay=0.01):
             'params': qk_params,
             'lr': lr,
             'weight_decay': weight_decay,
-            'is_qk': True,
-            'param_names': {id(p): param_names[id(p)] for p in qk_params}
+            'is_qk': True
         },
         {
             'params': other_params,
