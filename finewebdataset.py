@@ -1,382 +1,240 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from datasets import load_dataset
-import numpy as np
-from typing import Optional, Dict, List
-from transformers import AutoTokenizer
-from tqdm import tqdm
-import pickle
-from pathlib import Path
 import sys
+import torch
+from torch.utils.data import Dataset, IterableDataset, DataLoader
+from datasets import load_dataset
+from transformers import AutoTokenizer
+from typing import Optional, List, Dict
+import numpy as np
+import gc
+from tqdm import tqdm
+
 class FineWebDataset(Dataset):
     def __init__(
         self,
-        tokenizer,
-        max_length: int = 1024,
-        num_samples: int = 1_000_000,
-        cache_dir: str = "./fineweb_cache",
-        streaming: bool = True,
-        min_length: int = 100,
-        language: str = "en",
-        subset: str = "sample-10BT",  # or "sample-100BT" for larger
-        text_column: str = "text",
-        rebuild_cache: bool = False
+        num_samples: int = 10000,
+        max_length: int = 512,
+        tokenizer: AutoTokenizer = None,
+        cache_dir: str = "./cache",
+        streaming: bool = False
     ):
-        """
-        FineWeb dataset for training Nano KIMI K2
-        
-        Args:
-            tokenizer: HuggingFace tokenizer
-            max_length: Maximum sequence length
-            num_samples: Number of samples to use (1M default)
-            cache_dir: Directory to cache processed data
-            streaming: Use streaming mode for memory efficiency
-            min_length: Minimum text length to keep
-            language: Language filter (en for English)
-            subset: FineWeb subset to use
-            text_column: Column name containing text
-            rebuild_cache: Force rebuild cache
-        """
-        self.tokenizer = tokenizer
-        self.max_length = max_length
         self.num_samples = num_samples
-        self.min_length = min_length
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+        self.max_length = max_length
+        self.tokenizer = tokenizer
+        self.cache_dir = cache_dir
         
-        # Cache file paths
-        self.cache_file = self.cache_dir / f"fineweb_{num_samples}_{max_length}.pkl"
-        self.tokens_cache = self.cache_dir / f"fineweb_{num_samples}_tokens.npy"
-        
-        # Special tokens
-        self.bos_token = tokenizer.bos_token_id
-        self.eos_token = tokenizer.eos_token_id
-        self.pad_token = tokenizer.pad_token_id or 0
-        
-        if not rebuild_cache and self.cache_file.exists():
-            print(f"Loading cached dataset from {self.cache_file}")
-            with open(self.cache_file, 'rb') as f:
-                self.samples = pickle.load(f)
-        else:
-            print(f"Loading FineWeb dataset (first {num_samples:,} samples)...")
-            self.samples = self._prepare_dataset(streaming, subset, text_column)
-            
-            # Save cache
-            print(f"Saving cache to {self.cache_file}")
-            with open(self.cache_file, 'wb') as f:
-                pickle.dump(self.samples, f)
-        
-        print(f"Dataset ready with {len(self.samples):,} samples")
-    
-    def _prepare_dataset(self, streaming: bool, subset: str, text_column: str) -> List[Dict]:
-        """Load and prepare FineWeb dataset"""
-        samples = []
-        
-        # Load FineWeb dataset
         if streaming:
-            # Streaming mode - memory efficient
-            dataset = load_dataset(
-                "HuggingFaceFW/fineweb",
-                name=subset,
-                split="train",
-                streaming=True,
-            )
-            
-            # Process samples
-            pbar = tqdm(total=self.num_samples, desc="Processing FineWeb")
-            sample_count = 0
-            
-            for item in dataset:
-                if sample_count >= self.num_samples:
-                    break
-                
-                text = item.get(text_column, "")
-                
-                # Skip short texts
-                if len(text) < self.min_length:
-                    continue
-                
-                # Tokenize text
-                tokens = self.tokenizer.encode(
-                    text,
-                    max_length=self.max_length - 2,  # Reserve space for special tokens
-                    truncation=True
-                )
-                
-                # Skip if too short after tokenization
-                if len(tokens) < self.min_length // 4:  # Rough token estimate
-                    continue
-                
-                # Create sample
-                samples.extend(self._create_sequences(tokens))
-                
-                sample_count += 1
-                pbar.update(1)
-            
-            pbar.close()
+            print("Note: For streaming use FineWebStreamingDataset class")
         
-        else:
-            # Non-streaming mode - loads into memory
-            dataset = load_dataset(
-                "HuggingFaceFW/fineweb",
-                name=subset,
-                split=f"train[:{self.num_samples}]",
-            )
-            
-            print(f"Tokenizing {len(dataset):,} texts...")
-            for item in tqdm(dataset):
-                text = item.get(text_column, "")
-                
-                if len(text) < self.min_length:
-                    continue
-                
-                tokens = self.tokenizer.encode(
-                    text,
-                    max_length=self.max_length * 10,  # Get more tokens for chunking
-                    truncation=True
-                )
-                
-                samples.extend(self._create_sequences(tokens))
+        print(f"Loading FineWeb dataset with {num_samples} samples...")
         
-        return samples
-    
-    def _create_sequences(self, tokens: List[int]) -> List[Dict]:
-        """Create training sequences from token list"""
-        sequences = []
-        
-        # Sliding window approach
-        stride = self.max_length // 2  # 50% overlap
-        
-        for i in range(0, len(tokens) - self.min_length, stride):
-            chunk = tokens[i:i + self.max_length - 2]
-            
-            # Add special tokens
-            if self.bos_token is not None:
-                chunk = [self.bos_token] + chunk
-            if self.eos_token is not None:
-                chunk = chunk + [self.eos_token]
-            
-            # Pad if necessary
-            if len(chunk) < self.max_length:
-                padding_length = self.max_length - len(chunk)
-                attention_mask = [1] * len(chunk) + [0] * padding_length
-                chunk = chunk + [self.pad_token] * padding_length
-            else:
-                chunk = chunk[:self.max_length]
-                attention_mask = [1] * self.max_length
-            
-            sequences.append({
-                'input_ids': chunk[:-1],
-                'labels': chunk[1:],
-                'attention_mask': attention_mask[:-1]
-            })
-            
-            # Break if we only want one sequence per text
-            if len(tokens) < self.max_length * 2:
-                break
-        
-        return sequences
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        return {
-            'input_ids': torch.tensor(sample['input_ids'], dtype=torch.long),
-            'labels': torch.tensor(sample['labels'], dtype=torch.long),
-            'attention_mask': torch.tensor(sample['attention_mask'], dtype=torch.long)
-        }
-
-
-class FineWebStreamingDataset(torch.utils.data.IterableDataset):
-    """Streaming version for continuous training without storing all samples"""
-    
-    def __init__(
-        self,
-        tokenizer,
-        max_length: int = 1024,
-        num_samples: Optional[int] = 1_000_000,
-        buffer_size: int = 10000,
-        subset: str = "sample-10BT"
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.num_samples = num_samples
-        self.buffer_size = buffer_size
-        self.subset = subset
-        
-        # Special tokens
-        self.bos_token = tokenizer.bos_token_id
-        self.eos_token = tokenizer.eos_token_id
-        self.pad_token = tokenizer.pad_token_id or 0
-    
-    def __iter__(self):
-        # Load streaming dataset
-        dataset = load_dataset(
+        self.dataset = load_dataset(
             "HuggingFaceFW/fineweb",
-            name=self.subset,
-            split="train",
-            streaming=True,
+            name="sample-10BT",
+            split=f"train[:{num_samples}]",
+            cache_dir=cache_dir,
+            trust_remote_code=True
         )
         
-        samples_yielded = 0
-        token_buffer = []
-        
-        for item in dataset:
-            if self.num_samples and samples_yielded >= self.num_samples:
-                break
+        self.tokenized_samples = []
+        self._tokenize_dataset()
+    
+    def _tokenize_dataset(self):
+        print("Tokenizing dataset...")
+        for idx, example in enumerate(tqdm(self.dataset, desc="Tokenizing")):
+            text = example.get('text', '')
             
-            # Get text
-            text = item.get("text", "")
-            if len(text) < 100:
+            if not text:
                 continue
             
-            # Tokenize
-            tokens = self.tokenizer.encode(text, truncation=False)
-            token_buffer.extend(tokens)
+            tokens = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=True,
+                padding='max_length',
+                return_tensors='pt'
+            )
             
-            # Create samples from buffer
-            while len(token_buffer) >= self.max_length:
-                chunk = token_buffer[:self.max_length]
-                token_buffer = token_buffer[self.max_length // 2:]  # 50% overlap
-                
-                # Prepare input/label
-                input_ids = chunk[:-1]
-                labels = chunk[1:]
-                
-                # Pad if needed
-                if len(input_ids) < self.max_length - 1:
-                    pad_len = (self.max_length - 1) - len(input_ids)
-                    attention_mask = torch.ones(len(input_ids), dtype=torch.long)
-                    attention_mask = torch.cat([
-                        attention_mask,
-                        torch.zeros(pad_len, dtype=torch.long)
-                    ])
-                    input_ids = input_ids + [self.pad_token] * pad_len
-                    labels = labels + [self.pad_token] * pad_len
-                else:
-                    attention_mask = torch.ones(self.max_length - 1, dtype=torch.long)
-                
-                yield {
-                    'input_ids': torch.tensor(input_ids, dtype=torch.long),
-                    'labels': torch.tensor(labels, dtype=torch.long),
-                    'attention_mask': attention_mask
-                }
-                
-                samples_yielded += 1
-                
-                if self.num_samples and samples_yielded >= self.num_samples:
-                    break
+            self.tokenized_samples.append({
+                'input_ids': tokens['input_ids'].squeeze(0),
+                'attention_mask': tokens['attention_mask'].squeeze(0),
+                'labels': tokens['input_ids'].squeeze(0).clone()
+            })
+            
+            if len(self.tokenized_samples) >= self.num_samples:
+                break
+        
+        print(f"Tokenized {len(self.tokenized_samples)} samples")
+    
+    def __len__(self):
+        return len(self.tokenized_samples)
+    
+    def __getitem__(self, idx):
+        return self.tokenized_samples[idx]
 
+class FineWebStreamingDataset(IterableDataset):
+    def __init__(
+        self,
+        num_samples: Optional[int] = None,
+        max_length: int = 512,
+        tokenizer: AutoTokenizer = None,
+        batch_size: int = 1,
+        buffer_size: int = 1000
+    ):
+        self.num_samples = num_samples
+        self.max_length = max_length
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.samples_processed = 0
+    
+    def __iter__(self):
+        dataset = load_dataset(
+            "HuggingFaceFW/fineweb",
+            name="sample-10BT",
+            split="train",
+            streaming=True,
+            trust_remote_code=True
+        )
+        
+        buffer = []
+        
+        for example in dataset:
+            if self.num_samples and self.samples_processed >= self.num_samples:
+                break
+            
+            text = example.get('text', '')
+            
+            if not text:
+                continue
+            
+            tokens = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                truncation=True,
+                padding='max_length',
+                return_tensors='pt'
+            )
+            
+            sample = {
+                'input_ids': tokens['input_ids'].squeeze(0),
+                'attention_mask': tokens['attention_mask'].squeeze(0),
+                'labels': tokens['input_ids'].squeeze(0).clone()
+            }
+            
+            buffer.append(sample)
+            self.samples_processed += 1
+            
+            if len(buffer) >= self.buffer_size:
+                np.random.shuffle(buffer)
+                for item in buffer[:self.batch_size]:
+                    yield item
+                buffer = buffer[self.batch_size:]
+        
+        if buffer:
+            np.random.shuffle(buffer)
+            for item in buffer:
+                yield item
 
-# Usage example
-if __name__ == "__main__":
+class DataCollator:
+    def __init__(self, pad_token_id: int):
+        self.pad_token_id = pad_token_id
+    
+    def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        input_ids = torch.stack([f['input_ids'] for f in features])
+        attention_mask = torch.stack([f['attention_mask'] for f in features])
+        labels = torch.stack([f['labels'] for f in features])
+        
+        labels[attention_mask == 0] = -100
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        }
+
+def test_fineweb():
     from config import Config
+    from transformers import AutoTokenizer
+    
+    print("Testing FineWeb Dataset Integration...")
+    
     config = Config()
-    # Initialize tokenizer
-    # tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    config.max_batch_size = 2
+    
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    config = Config()
-    config.vocab_size = len(tokenizer)
-    
-    # Option 1: Regular dataset (caches everything)
-    # print("Loading FineWeb dataset...")
-    # dataset = FineWebDataset(
-    #     tokenizer=tokenizer,
-    #     max_length=config.max_seq_length,
-    #     num_samples=1_000_000,  # First 1M samples
-    #     cache_dir="./fineweb_cache",
-    #     streaming=True,  # Memory efficient loading
-    #     min_length=100,
-    #     rebuild_cache=False  # Set True to rebuild cache
-    # )
-    
-    # # Create dataloader
-    # dataloader = DataLoader(
-    #     dataset,
-    #     batch_size=config.max_batch_size,
-    #     shuffle=True,
-    #     num_workers=4,
-    #     pin_memory=torch.cuda.is_available(),
-    #     drop_last=True
-    # )
-    
-    # print(f"\nDataset stats:")
-    # print(f"  Total samples: {len(dataset):,}")
-    # print(f"  Batches: {len(dataloader):,}")
-    # print(f"  Tokens per epoch: ~{len(dataset) * config.max_seq_length:,}")
-    
-    # Option 2: Streaming dataset (no storage, continuous)
-    streaming_dataset = FineWebStreamingDataset(
-        tokenizer=tokenizer,
+    print("\n1. Testing Standard Dataset...")
+    dataset = FineWebDataset(
+        num_samples=100,
         max_length=config.max_seq_length,
-        num_samples=1_000_000
+        tokenizer=tokenizer,
+        cache_dir="./cache"
+    )
+    
+    print(f"Dataset size: {len(dataset)}")
+    
+    collator = DataCollator(tokenizer.pad_token_id)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.max_batch_size,
+        shuffle=True,
+        collate_fn=collator,
+        num_workers=0
+    )
+    
+    batch = next(iter(dataloader))
+    print(f"\nBatch shapes:")
+    print(f"  input_ids: {batch['input_ids'].shape}")
+    print(f"  labels: {batch['labels'].shape}")
+    print(f"  attention_mask: {batch['attention_mask'].shape}")
+    
+    sample_text = tokenizer.decode(batch['input_ids'][0][:50])
+    print(f"\nSample text (first 50 tokens):")
+    print(sample_text)
+    
+    print("\n2. Testing Streaming Dataset...")
+    streaming_dataset = FineWebStreamingDataset(
+        num_samples=50,
+        max_length=config.max_seq_length,
+        tokenizer=tokenizer,
+        batch_size=1,
+        buffer_size=10
     )
     
     streaming_loader = DataLoader(
         streaming_dataset,
         batch_size=config.max_batch_size,
-        num_workers=0,  # Must be 0 for IterableDataset
+        num_workers=0,
         pin_memory=torch.cuda.is_available()
     )
     
-    # Test batch
     batch = next(iter(streaming_loader))
     print(f"\nBatch shapes:")
     print(f"  input_ids: {batch['input_ids'].shape}")
     print(f"  labels: {batch['labels'].shape}")
     print(f"  attention_mask: {batch['attention_mask'].shape}")
     
-    # Decode sample
     sample_text = tokenizer.decode(batch['input_ids'][0][:50])
     print(f"\nSample text (first 50 tokens):")
     print(sample_text)
-    sys.exit(0)
-    # Training loop example
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # model = Transformer(config).to(device)
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     
-    # print("\nStarting training on FineWeb...")
-    # for epoch in range(1):
-    #     total_loss = 0
-    #     progress = tqdm(dataloader, desc=f"Epoch {epoch}")
-        
-    #     for batch_idx, batch in enumerate(progress):
-    #         input_ids = batch['input_ids'].to(device)
-    #         labels = batch['labels'].to(device)
-    #         attention_mask = batch['attention_mask'].to(device)
-            
-    #         # Reset cache every N batches to prevent memory issues
-    #         if batch_idx % 100 == 0:
-    #             for layer in model.layers:
-    #                 layer.attn.k_cache.zero_()
-    #                 layer.attn.v_cache.zero_()
-            
-    #         # Forward
-    #         logits = model(input_ids, start_pos=0)
-            
-    #         # Loss (ignore padding)
-    #         loss = F.cross_entropy(
-    #             logits.view(-1, config.vocab_size),
-    #             labels.view(-1),
-    #             ignore_index=tokenizer.pad_token_id
-    #         )
-            
-    #         # Backward
-    #         loss.backward()
-    #         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    #         optimizer.step()
-    #         optimizer.zero_grad()
-            
-    #         total_loss += loss.item()
-    #         progress.set_postfix({'loss': loss.item()})
-            
-    #         if batch_idx >= 100:  # Quick test
-    #             break
-        
-    #     print(f"Epoch {epoch} - Avg Loss: {total_loss / (batch_idx + 1):.4f}")
+    print("\n✅ FineWeb dataset test completed successfully!")
+    
+    del dataset
+    del streaming_dataset
+    del dataloader
+    del streaming_loader
+    gc.collect()
+    
+    return True
+
+if __name__ == "__main__":
+    success = test_fineweb()
+    if success:
+        print("\nAll tests passed!")
+        sys.exit(0)
+    else:
+        print("\nTests failed!")
+        sys.exit(1)

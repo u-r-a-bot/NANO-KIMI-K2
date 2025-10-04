@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use('Agg')
 from typing import Optional, Dict, List
 import argparse
+import gc
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -233,7 +234,23 @@ class Trainer:
         
         plt.tight_layout()
         plt.savefig(self.log_dir / 'training_metrics.png')
-        plt.close()
+        plt.close(fig)
+        plt.close('all')
+    
+    def cleanup_resources(self):
+        """Clean up resources after training"""
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        plt.close('all')
+        
+        del self.optimizer
+        del self.scaler
+        gc.collect()
+        
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
     
     def train(self):
         self.model.train()
@@ -256,6 +273,7 @@ class Trainer:
         
         accumulated_loss = 0
         accumulation_counter = 0
+        training_completed = False
         
         with Progress(
             SpinnerColumn(),
@@ -352,7 +370,11 @@ class Trainer:
                         self.save_checkpoint()
                     
                     if self.global_step >= self.max_steps:
+                        training_completed = True
                         break
+            
+            del data_iter
+            gc.collect()
         
         final_val_loss = self.evaluate() if self.val_loader else 0.0
         
@@ -366,11 +388,15 @@ class Trainer:
             border_style="green"
         ))
         
-        self.save_checkpoint()
+        self.save_checkpoint('final_model.pt')
         self.plot_metrics()
         
         with open(self.log_dir / 'training_metrics.json', 'w') as f:
             json.dump(self.metrics, f, indent=2)
+        
+        self.cleanup_resources()
+        
+        return training_completed
 
 def main():
     parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
@@ -415,76 +441,53 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     config.vocab_size = len(tokenizer)
-    config.max_batch_size = args.batch_size
     
-    console.print("[yellow]Preparing dataset...[/yellow]")
-    
+    console.print("[yellow]Loading dataset...[/yellow]")
     if args.dataset == 'fineweb':
         dataset = FineWebDataset(
-            tokenizer=tokenizer,
             num_samples=args.num_samples,
-            max_length=config.max_seq_length
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=2,
-            collate_fn=DataCollator(tokenizer.pad_token_id),
-            drop_last=True
+            max_length=config.max_seq_length,
+            tokenizer=tokenizer,
+            cache_dir="./cache",
+            streaming=False
         )
     elif args.dataset == 'streaming':
         dataset = FineWebStreamingDataset(
+            num_samples=args.num_samples,
+            max_length=config.max_seq_length,
             tokenizer=tokenizer,
-            max_length=config.max_seq_length
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            num_workers=0,
-            collate_fn=DataCollator(tokenizer.pad_token_id),
-            drop_last=True
+            batch_size=args.batch_size
         )
     else:
-        data_path = Path(args.data_path)
-        if not data_path.exists():
-            console.print(f"[yellow]Data file not found, creating sample dataset...[/yellow]")
-            data_path.parent.mkdir(parents=True, exist_ok=True)
-            sample_path = data_path.parent / 'sample_train.txt'
-            sample_text = "The quick brown fox jumps over the lazy dog. " * 5000
-            sample_path.write_text(sample_text)
-            data_path = sample_path
-        
         dataset = TextDataset(
-            file_path=data_path,
+            file_path=args.data_path,
             tokenizer=tokenizer,
             max_length=config.max_seq_length,
-            stride=512,
-            min_length=32,
-            combine_short=True,
-            cache_tokens=False
-        )
-        dataloader = DataLoader(
-            dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=0,
-            collate_fn=DataCollator(tokenizer.pad_token_id),
-            drop_last=True
+            stride=256
         )
     
-    dataset_size = len(dataset) if hasattr(dataset, '__len__') else 'streaming'
-    console.print(f"[green]Dataset ready with {dataset_size} samples[/green]")
+    collator = DataCollator(tokenizer.pad_token_id)
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True if args.dataset != 'streaming' else False,
+        num_workers=0 if args.dataset == 'streaming' else 2,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collator,
+        drop_last=True
+    )
+    
+    console.print(f"[green]Dataset loaded: {len(dataset)} samples[/green]")
     
     console.print("[yellow]Initializing model...[/yellow]")
-    
     model = Transformer(config)
     
     dtype = torch.float32
-    if args.device == 'cuda':
-        dtype = torch.bfloat16
-        model = model.to(dtype=dtype)
-        console.print("[green]Using bfloat16 precision on CUDA[/green]")
+    if args.mixed_precision and args.device == 'cuda':
+        dtype = torch.float16
+        model = model.to(dtype=torch.float16)
+        console.print("[green]Using float16 precision on CUDA[/green]")
     elif args.device == 'mps':
         model = model.to(dtype=torch.float32)
         console.print("[green]Using float32 precision on MPS[/green]")
@@ -524,20 +527,46 @@ def main():
         if not loaded:
             console.print("[yellow]No checkpoint found, starting from scratch[/yellow]")
     
+    training_success = False
+    exception_occurred = False
+    
     try:
-        trainer.train()
+        training_success = trainer.train()
     except KeyboardInterrupt:
         console.print("\n[yellow]Training interrupted by user[/yellow]")
-        trainer.save_checkpoint()
+        trainer.save_checkpoint('interrupted_checkpoint.pt')
         console.print("[green]Checkpoint saved[/green]")
+        exception_occurred = True
     except Exception as e:
         console.print(f"\n[red]Training error: {e}[/red]")
-        trainer.save_checkpoint()
+        trainer.save_checkpoint('error_checkpoint.pt')
         console.print("[green]Emergency checkpoint saved[/green]")
+        exception_occurred = True
         raise e
     finally:
-        console.print("[cyan]Exiting training script[/cyan]")
-        sys.exit(0)
+        if training_success and not exception_occurred:
+            console.print("[bold green]Training completed successfully![/bold green]")
+        elif not exception_occurred:
+            console.print("[yellow]Training ended before completion[/yellow]")
+        
+        del trainer
+        del model
+        del dataloader
+        del dataset
+        
+        gc.collect()
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        console.print("[cyan]All resources cleaned up[/cyan]")
+    
+    if training_success:
+        return 0
+    else:
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    sys.exit(exit_code)
