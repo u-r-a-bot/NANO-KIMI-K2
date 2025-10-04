@@ -92,9 +92,9 @@ class Trainer:
             qk_clip_enabled=True
         )
         
-        self.scaler = torch.amp.GradScaler('cuda') if mixed_precision and device == 'cuda' and dtype == torch.float16 else None
-        self.mixed_precision = mixed_precision
-        self.use_amp = mixed_precision and device == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda') if (mixed_precision and device == 'cuda' and dtype == torch.float16) else None
+        self.mixed_precision = mixed_precision and device == 'cuda' and dtype == torch.float16
+        self.use_amp = self.mixed_precision
         
         self.global_step = 0
         self.epoch = 0
@@ -104,6 +104,7 @@ class Trainer:
         self.metrics = {
             'train_loss': [],
             'val_loss': [],
+            'val_steps': [],
             'learning_rate': [],
             'grad_norm': [],
             'max_logits': [],
@@ -142,13 +143,11 @@ class Trainer:
             'metrics': self.metrics
         }
         
-        if self.scaler:
+        if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         torch.save(checkpoint, checkpoint_path)
-        console.print(f"[green]Saved checkpoint: {checkpoint_path}[/green]")
-        
-        return checkpoint_path
+        console.print(f"[green]Checkpoint saved: {checkpoint_path}[/green]")
     
     def load_checkpoint(self, checkpoint_path: Optional[str] = None):
         if checkpoint_path is None:
@@ -156,15 +155,13 @@ class Trainer:
             if not checkpoints:
                 return False
             checkpoint_path = checkpoints[-1]
-        else:
-            checkpoint_path = Path(checkpoint_path)
         
+        checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
-            console.print(f"[yellow]Checkpoint not found: {checkpoint_path}[/yellow]")
+            console.print(f"[red]Checkpoint not found: {checkpoint_path}[/red]")
             return False
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
@@ -172,12 +169,10 @@ class Trainer:
         self.best_loss = checkpoint['best_loss']
         self.metrics = checkpoint['metrics']
         
-        if self.scaler and 'scaler_state_dict' in checkpoint:
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
-        console.print(f"[green]Loaded checkpoint: {checkpoint_path}[/green]")
-        console.print(f"[cyan]Resuming from step {self.global_step}[/cyan]")
-        
+        console.print(f"[green]Checkpoint loaded: {checkpoint_path}[/green]")
         return True
     
     @torch.no_grad()
@@ -193,13 +188,8 @@ class Trainer:
             input_ids = batch['input_ids'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
-                logits = self.model(input_ids, start_pos=0, use_cache=False)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, self.model.vocab_size),
-                    labels.reshape(-1),
-                    ignore_index=0
-                )
+            logits = self.model(input_ids, start_pos=0, use_cache=False)
+            loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
             
             total_loss += loss.item()
             num_batches += 1
@@ -222,9 +212,8 @@ class Trainer:
         axes[0, 0].set_title('Training Loss')
         axes[0, 0].grid(True)
         
-        if self.metrics['val_loss']:
-            val_steps = [self.metrics['steps'][i] for i in range(0, len(self.metrics['val_loss']))]
-            axes[0, 1].plot(val_steps, self.metrics['val_loss'])
+        if self.metrics['val_loss'] and self.metrics['val_steps']:
+            axes[0, 1].plot(self.metrics['val_steps'], self.metrics['val_loss'])
             axes[0, 1].set_xlabel('Steps')
             axes[0, 1].set_ylabel('Validation Loss')
             axes[0, 1].set_title('Validation Loss')
@@ -258,7 +247,8 @@ class Trainer:
             f"Weight Decay: {self.weight_decay}\n"
             f"QK-Clip Tau: {self.qk_clip_tau}\n"
             f"Gradient Accumulation: {self.gradient_accumulation_steps}\n"
-            f"Device: {self.device}",
+            f"Device: {self.device}\n"
+            f"Mixed Precision: {self.mixed_precision}",
             title="Training Configuration",
             border_style="green"
         )
@@ -277,7 +267,6 @@ class Trainer:
             console=console
         ) as progress:
             train_task = progress.add_task("[cyan]Training...", total=self.max_steps)
-            progress.update(train_task, completed=self.global_step)
             
             data_iter = iter(self.train_loader)
             
@@ -287,25 +276,20 @@ class Trainer:
                 except StopIteration:
                     data_iter = iter(self.train_loader)
                     batch = next(data_iter)
+                    self.epoch += 1
                 
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
-                attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
                 
-                with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=self.dtype):
+                if self.use_amp:
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        logits = self.model(input_ids, start_pos=0, use_cache=False)
+                        loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+                else:
                     logits = self.model(input_ids, start_pos=0, use_cache=False)
-                    
-                    loss = F.cross_entropy(
-                        logits.reshape(-1, self.model.vocab_size),
-                        labels.reshape(-1),
-                        ignore_index=0,
-                        reduction='none'
-                    )
-                    masked_loss = loss * attention_mask.reshape(-1)
-                    loss = masked_loss.sum() / attention_mask.sum().clamp(min=1)
-                    loss = loss / self.gradient_accumulation_steps
+                    loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
                 
-                max_logits = self.compute_max_logits(logits)
+                loss = loss / self.gradient_accumulation_steps
                 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
@@ -316,13 +300,12 @@ class Trainer:
                 accumulation_counter += 1
                 
                 if accumulation_counter >= self.gradient_accumulation_steps:
+                    max_logits = self.compute_max_logits(logits)
+                    
                     if self.scaler:
                         self.scaler.unscale_(self.optimizer)
                     
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.max_grad_norm
-                    )
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     
                     lr = self.update_lr()
                     
@@ -358,6 +341,7 @@ class Trainer:
                     if self.global_step % self.eval_interval == 0 and self.val_loader:
                         val_loss = self.evaluate()
                         self.metrics['val_loss'].append(val_loss)
+                        self.metrics['val_steps'].append(self.global_step)
                         console.print(f"[yellow]Validation Loss: {val_loss:.4f}[/yellow]")
                         
                         if val_loss < self.best_loss:
@@ -469,9 +453,10 @@ def main():
             sample_path = data_path.parent / 'sample_train.txt'
             sample_text = "The quick brown fox jumps over the lazy dog. " * 5000
             sample_path.write_text(sample_text)
+            data_path = sample_path
         
         dataset = TextDataset(
-            file_path=sample_path,
+            file_path=data_path,
             tokenizer=tokenizer,
             max_length=config.max_seq_length,
             stride=512,

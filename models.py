@@ -113,9 +113,10 @@ class MLP(nn.Module):
         self.w1 = nn.Linear(dim, inter_dim, bias=False)
         self.w2 = nn.Linear(inter_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, inter_dim, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 class Expert(nn.Module):
     def __init__(self, dim: int, hid_dim: int):

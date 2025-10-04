@@ -17,7 +17,7 @@ def get_vocab_size(tokenizer_name: str) -> int:
 @dataclass
 class Config:
     tokenizer_name:str = "HuggingFaceTB/SmolLM-135M"
-    vocab_size: int = get_vocab_size(tokenizer_name) if not None else 49152 # Original Kimi K2- 163,842, 
+    vocab_size: int = get_vocab_size(tokenizer_name) if get_vocab_size(tokenizer_name) is not None else 49152 # Original Kimi K2- 163,842, 
     dim: int = 768
     dropout: float = 0.1
     n_heads: int = 4
