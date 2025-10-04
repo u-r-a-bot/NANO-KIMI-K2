@@ -477,8 +477,8 @@ def main():
         collate_fn=collator,
         drop_last=True
     )
-    
-    console.print(f"[green]Dataset loaded: {len(dataset)} samples[/green]")
+    if args.dataset != 'streaming':
+        console.print(f"[green]Dataset loaded: {len(dataset)} samples[/green]")
     
     console.print("[yellow]Initializing model...[/yellow]")
     model = Transformer(config)
