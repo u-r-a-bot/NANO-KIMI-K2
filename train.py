@@ -73,29 +73,23 @@ class Trainer:
         self.qk_clip_tau = qk_clip_tau
         
         self.checkpoint_dir = Path(checkpoint_dir)
-        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        param_groups = get_muon_param_groups(
-            self.model,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay
-        )
-        
+        param_groups = get_muon_param_groups(self.model, lr=learning_rate, weight_decay=weight_decay)
         self.optimizer = MuonClip(
             param_groups,
-            lr=self.learning_rate,
-            momentum=self.momentum,
-            nesterov=True,
-            weight_decay=self.weight_decay,
-            qk_clip_tau=self.qk_clip_tau,
+            lr=learning_rate,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            qk_clip_tau=qk_clip_tau,
             qk_clip_enabled=True
         )
         
-        self.scaler = torch.amp.GradScaler('cuda') if (mixed_precision and device == 'cuda' and dtype == torch.float16) else None
-        self.mixed_precision = mixed_precision and device == 'cuda' and dtype == torch.float16
+        self.mixed_precision = mixed_precision and device == 'cuda'
         self.use_amp = self.mixed_precision
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         
         self.global_step = 0
         self.epoch = 0
@@ -103,14 +97,16 @@ class Trainer:
         self.start_time = time.time()
         
         self.metrics = {
+            'steps': [],
             'train_loss': [],
             'val_loss': [],
             'val_steps': [],
             'learning_rate': [],
-            'grad_norm': [],
-            'max_logits': [],
-            'steps': []
+            'grad_norm': []
         }
+    
+    def compute_max_logits(self, logits: torch.Tensor) -> float:
+        return logits.abs().max().item()
     
     def update_lr(self):
         if self.global_step < self.warmup_steps:
@@ -124,16 +120,15 @@ class Trainer:
         
         return lr
     
-    def compute_max_logits(self, logits):
-        with torch.no_grad():
-            max_logit = logits.abs().max().item()
-        return max_logit
-    
-    def save_checkpoint(self, filename: Optional[str] = None):
-        if filename is None:
-            filename = f'checkpoint_step_{self.global_step}.pt'
-        
-        checkpoint_path = self.checkpoint_dir / filename
+    def save_checkpoint(self, checkpoint_type='latest'):
+        if checkpoint_type == 'best':
+            checkpoint_path = self.checkpoint_dir / 'best_model.pt'
+            console.print(f"[green]Saving best model (loss: {self.best_loss:.4f})[/green]")
+        elif checkpoint_type == 'final':
+            checkpoint_path = self.checkpoint_dir / 'final_model.pt'
+            console.print("[green]Saving final model[/green]")
+        else:
+            checkpoint_path = self.checkpoint_dir / 'latest_checkpoint.pt'
         
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -148,109 +143,132 @@ class Trainer:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         torch.save(checkpoint, checkpoint_path)
-        console.print(f"[green]Checkpoint saved: {checkpoint_path}[/green]")
+        
+        if checkpoint_type == 'latest':
+            console.print(f"[cyan]Checkpoint saved at step {self.global_step}[/cyan]")
     
     def load_checkpoint(self, checkpoint_path: Optional[str] = None):
         if checkpoint_path is None:
-            checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_step_*.pt'))
-            if not checkpoints:
-                return False
-            checkpoint_path = checkpoints[-1]
+            checkpoint_path = self.checkpoint_dir / 'latest_checkpoint.pt'
+        else:
+            checkpoint_path = Path(checkpoint_path)
         
-        checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
-            console.print(f"[red]Checkpoint not found: {checkpoint_path}[/red]")
+            console.print(f"[yellow]No checkpoint found at {checkpoint_path}[/yellow]")
             return False
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.global_step = checkpoint['global_step']
-        self.epoch = checkpoint['epoch']
-        self.best_loss = checkpoint['best_loss']
-        self.metrics = checkpoint['metrics']
-        
-        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        console.print(f"[green]Checkpoint loaded: {checkpoint_path}[/green]")
-        return True
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.global_step = checkpoint['global_step']
+            self.epoch = checkpoint['epoch']
+            self.best_loss = checkpoint['best_loss']
+            self.metrics = checkpoint['metrics']
+            
+            if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+            console.print(f"[green]Checkpoint loaded from: {checkpoint_path}[/green]")
+            console.print(f"[cyan]Resuming from step {self.global_step}, epoch {self.epoch}[/cyan]")
+            return True
+        except Exception as e:
+            console.print(f"[red]Error loading checkpoint: {e}[/red]")
+            return False
     
     @torch.no_grad()
     def evaluate(self):
         if self.val_loader is None:
-            return 0.0
+            return None
         
         self.model.eval()
         total_loss = 0
         num_batches = 0
         
-        for batch in self.val_loader:
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            
-            logits = self.model(input_ids, start_pos=0, use_cache=False)
-            loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-            
-            total_loss += loss.item()
-            num_batches += 1
-            
-            if num_batches >= 10:
-                break
+        try:
+            for batch in self.val_loader:
+                input_ids = batch['input_ids'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
+                logits = self.model(input_ids, start_pos=0, use_cache=False)
+                loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                if num_batches >= 10:
+                    break
+        except Exception as e:
+            console.print(f"[red]Evaluation error: {e}[/red]")
+            return None
+        finally:
+            self.model.train()
         
-        self.model.train()
-        return total_loss / max(num_batches, 1)
+        if num_batches == 0:
+            return None
+        
+        return total_loss / num_batches
     
     def plot_metrics(self):
         if not self.metrics['steps']:
             return
         
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        
-        axes[0, 0].plot(self.metrics['steps'], self.metrics['train_loss'])
-        axes[0, 0].set_xlabel('Steps')
-        axes[0, 0].set_ylabel('Train Loss')
-        axes[0, 0].set_title('Training Loss')
-        axes[0, 0].grid(True)
-        
-        if self.metrics['val_loss'] and self.metrics['val_steps']:
-            axes[0, 1].plot(self.metrics['val_steps'], self.metrics['val_loss'])
-            axes[0, 1].set_xlabel('Steps')
-            axes[0, 1].set_ylabel('Validation Loss')
-            axes[0, 1].set_title('Validation Loss')
-            axes[0, 1].grid(True)
-        
-        axes[1, 0].plot(self.metrics['steps'], self.metrics['learning_rate'])
-        axes[1, 0].set_xlabel('Steps')
-        axes[1, 0].set_ylabel('Learning Rate')
-        axes[1, 0].set_title('Learning Rate Schedule')
-        axes[1, 0].grid(True)
-        
-        axes[1, 1].plot(self.metrics['steps'], self.metrics['grad_norm'])
-        axes[1, 1].set_xlabel('Steps')
-        axes[1, 1].set_ylabel('Gradient Norm')
-        axes[1, 1].set_title('Gradient Norm')
-        axes[1, 1].grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(self.log_dir / 'training_metrics.png')
-        plt.close(fig)
-        plt.close('all')
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+            
+            axes[0, 0].plot(self.metrics['steps'], self.metrics['train_loss'])
+            axes[0, 0].set_xlabel('Steps')
+            axes[0, 0].set_ylabel('Train Loss')
+            axes[0, 0].set_title('Training Loss')
+            axes[0, 0].grid(True)
+            
+            if self.metrics['val_loss'] and self.metrics['val_steps']:
+                axes[0, 1].plot(self.metrics['val_steps'], self.metrics['val_loss'])
+                axes[0, 1].set_xlabel('Steps')
+                axes[0, 1].set_ylabel('Validation Loss')
+                axes[0, 1].set_title('Validation Loss')
+                axes[0, 1].grid(True)
+            
+            axes[1, 0].plot(self.metrics['steps'], self.metrics['learning_rate'])
+            axes[1, 0].set_xlabel('Steps')
+            axes[1, 0].set_ylabel('Learning Rate')
+            axes[1, 0].set_title('Learning Rate Schedule')
+            axes[1, 0].grid(True)
+            
+            axes[1, 1].plot(self.metrics['steps'], self.metrics['grad_norm'])
+            axes[1, 1].set_xlabel('Steps')
+            axes[1, 1].set_ylabel('Gradient Norm')
+            axes[1, 1].set_title('Gradient Norm')
+            axes[1, 1].grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(self.log_dir / 'training_metrics.png', dpi=100)
+            console.print(f"[green]Metrics plot saved to {self.log_dir / 'training_metrics.png'}[/green]")
+        except Exception as e:
+            console.print(f"[red]Error plotting metrics: {e}[/red]")
+        finally:
+            plt.close(fig)
+            plt.close('all')
     
     def cleanup_resources(self):
-        """Clean up resources after training"""
+        console.print("[yellow]Cleaning up resources...[/yellow]")
+        
+        plt.close('all')
+        
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        plt.close('all')
-        
         del self.optimizer
-        del self.scaler
+        if self.scaler is not None:
+            del self.scaler
+        
         gc.collect()
         
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
+        
+        console.print("[green]Resources cleaned up[/green]")
     
     def train(self):
         self.model.train()
@@ -335,60 +353,59 @@ class Trainer:
                     
                     self.optimizer.zero_grad()
                     
+                    self.metrics['steps'].append(self.global_step)
                     self.metrics['train_loss'].append(accumulated_loss)
                     self.metrics['learning_rate'].append(lr)
-                    self.metrics['grad_norm'].append(grad_norm.item())
-                    self.metrics['max_logits'].append(max_logits)
-                    self.metrics['steps'].append(self.global_step)
+                    self.metrics['grad_norm'].append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
                     
-                    progress.update(train_task, advance=1)
-                    
-                    if self.global_step % 10 == 0:
-                        progress.console.print(
-                            f"[cyan]Step {self.global_step}/{self.max_steps}[/cyan] | "
-                            f"Loss: {accumulated_loss:.4f} | "
-                            f"LR: {lr:.6f} | "
-                            f"Grad: {grad_norm:.4f} | "
-                            f"MaxLogits: {max_logits:.2f}"
-                        )
+                    progress.update(
+                        train_task,
+                        advance=1,
+                        description=f"[cyan]Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}"
+                    )
                     
                     accumulated_loss = 0
                     accumulation_counter = 0
                     self.global_step += 1
                     
-                    if self.global_step % self.eval_interval == 0 and self.val_loader:
+                    if self.global_step % self.eval_interval == 0:
                         val_loss = self.evaluate()
-                        self.metrics['val_loss'].append(val_loss)
-                        self.metrics['val_steps'].append(self.global_step)
-                        console.print(f"[yellow]Validation Loss: {val_loss:.4f}[/yellow]")
-                        
-                        if val_loss < self.best_loss:
-                            self.best_loss = val_loss
-                            self.save_checkpoint('best_model.pt')
+                        if val_loss is not None:
+                            self.metrics['val_loss'].append(val_loss)
+                            self.metrics['val_steps'].append(self.global_step)
+                            console.print(f"[yellow]Step {self.global_step} | Val Loss: {val_loss:.4f}[/yellow]")
+                            
+                            if val_loss < self.best_loss:
+                                self.best_loss = val_loss
+                                self.save_checkpoint('best')
                     
                     if self.global_step % self.save_interval == 0:
-                        self.save_checkpoint()
+                        self.save_checkpoint('latest')
                     
                     if self.global_step >= self.max_steps:
                         training_completed = True
                         break
-            
-            del data_iter
-            gc.collect()
         
-        final_val_loss = self.evaluate() if self.val_loader else 0.0
+        final_val_loss = self.evaluate()
+        if final_val_loss is not None:
+            self.metrics['val_loss'].append(final_val_loss)
+            self.metrics['val_steps'].append(self.global_step)
+            
+            if final_val_loss < self.best_loss:
+                self.best_loss = final_val_loss
+                self.save_checkpoint('best')
         
         console.print(Panel.fit(
             f"[bold green]Training Complete![/bold green]\n"
             f"Total Steps: {self.global_step:,}\n"
-            f"Final Val Loss: {final_val_loss:.4f}\n"
+            f"Final Val Loss: {final_val_loss if final_val_loss is not None else 'N/A'}\n"
             f"Best Loss: {self.best_loss:.4f}\n"
             f"Time: {(time.time() - self.start_time) / 3600:.1f} hours",
             title="Training Summary",
             border_style="green"
         ))
         
-        self.save_checkpoint('final_model.pt')
+        self.save_checkpoint('final')
         self.plot_metrics()
         
         with open(self.log_dir / 'training_metrics.json', 'w') as f:
@@ -436,35 +453,43 @@ def main():
     config = Config()
     
     console.print("[yellow]Loading tokenizer...[/yellow]")
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+    except Exception as e:
+        console.print(f"[red]Error loading tokenizer: {e}[/red]")
+        return 1
     
     config.vocab_size = len(tokenizer)
     
     console.print("[yellow]Loading dataset...[/yellow]")
-    if args.dataset == 'fineweb':
-        dataset = FineWebDataset(
-            num_samples=args.num_samples,
-            max_length=config.max_seq_length,
-            tokenizer=tokenizer,
-            cache_dir="./cache",
-            streaming=False
-        )
-    elif args.dataset == 'streaming':
-        dataset = FineWebStreamingDataset(
-            num_samples=args.num_samples,
-            max_length=config.max_seq_length,
-            tokenizer=tokenizer,
-            batch_size=args.batch_size
-        )
-    else:
-        dataset = TextDataset(
-            file_path=args.data_path,
-            tokenizer=tokenizer,
-            max_length=config.max_seq_length,
-            stride=256
-        )
+    try:
+        if args.dataset == 'fineweb':
+            dataset = FineWebDataset(
+                num_samples=args.num_samples,
+                max_length=config.max_seq_length,
+                tokenizer=tokenizer,
+                cache_dir="./cache",
+                streaming=False
+            )
+        elif args.dataset == 'streaming':
+            dataset = FineWebStreamingDataset(
+                num_samples=args.num_samples,
+                max_length=config.max_seq_length,
+                tokenizer=tokenizer,
+                batch_size=args.batch_size
+            )
+        else:
+            dataset = TextDataset(
+                file_path=args.data_path,
+                tokenizer=tokenizer,
+                max_length=config.max_seq_length,
+                stride=256
+            )
+    except Exception as e:
+        console.print(f"[red]Error loading dataset: {e}[/red]")
+        return 1
     
     collator = DataCollator(tokenizer.pad_token_id)
     
@@ -477,8 +502,11 @@ def main():
         collate_fn=collator,
         drop_last=True
     )
-    if args.dataset != 'streaming':
+    
+    if hasattr(dataset, '__len__'):
         console.print(f"[green]Dataset loaded: {len(dataset)} samples[/green]")
+    else:
+        console.print(f"[green]Streaming dataset loaded (num_samples: {args.num_samples if args.num_samples else 'unlimited'})[/green]")
     
     console.print("[yellow]Initializing model...[/yellow]")
     model = Transformer(config)
@@ -486,13 +514,13 @@ def main():
     dtype = torch.float32
     if args.mixed_precision and args.device == 'cuda':
         dtype = torch.float16
-        model = model
+        model = model.to(dtype=torch.float16)
         console.print("[green]Using float16 precision on CUDA[/green]")
     elif args.device == 'mps':
-        model = model
+        model = model.to(dtype=torch.float32)
         console.print("[green]Using float32 precision on MPS[/green]")
     else:
-        model = model
+        model = model.to(dtype=torch.float32)
         console.print("[green]Using float32 precision on CPU[/green]")
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -534,25 +562,29 @@ def main():
         training_success = trainer.train()
     except KeyboardInterrupt:
         console.print("\n[yellow]Training interrupted by user[/yellow]")
-        trainer.save_checkpoint('interrupted_checkpoint.pt')
+        trainer.save_checkpoint('latest')
         console.print("[green]Checkpoint saved[/green]")
         exception_occurred = True
     except Exception as e:
         console.print(f"\n[red]Training error: {e}[/red]")
-        trainer.save_checkpoint('error_checkpoint.pt')
+        import traceback
+        traceback.print_exc()
+        trainer.save_checkpoint('latest')
         console.print("[green]Emergency checkpoint saved[/green]")
         exception_occurred = True
-        raise e
     finally:
         if training_success and not exception_occurred:
             console.print("[bold green]Training completed successfully![/bold green]")
         elif not exception_occurred:
             console.print("[yellow]Training ended before completion[/yellow]")
         
-        del trainer
-        del model
-        del dataloader
-        del dataset
+        try:
+            del trainer
+            del model
+            del dataloader
+            del dataset
+        except:
+            pass
         
         gc.collect()
         
@@ -562,10 +594,7 @@ def main():
         
         console.print("[cyan]All resources cleaned up[/cyan]")
     
-    if training_success:
-        return 0
-    else:
-        return 1
+    return 0 if training_success else 1
 
 if __name__ == "__main__":
     exit_code = main()

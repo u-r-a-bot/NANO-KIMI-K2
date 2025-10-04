@@ -1,7 +1,7 @@
 import torch
-from torch.optim.optimizer import Optimizer
-from typing import List, Optional
+from torch.optim import Optimizer
 import math
+from typing import List, Optional
 
 class MuonClip(Optimizer):
     def __init__(
@@ -9,35 +9,37 @@ class MuonClip(Optimizer):
         params,
         lr: float = 0.02,
         momentum: float = 0.95,
-        nesterov: bool = True,
         weight_decay: float = 0.0,
+        nesterov: bool = False,
+        newton_schulz_steps: int = 5,
         qk_clip_tau: float = 100.0,
-        qk_clip_enabled: bool = True,
-        newton_schulz_steps: int = 5
+        qk_clip_enabled: bool = True
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
-        if momentum < 0.0:
+        if momentum < 0.0 or momentum >= 1.0:
             raise ValueError(f"Invalid momentum value: {momentum}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if qk_clip_tau <= 0.0:
+            raise ValueError(f"Invalid qk_clip_tau: {qk_clip_tau}")
         
         defaults = dict(
             lr=lr,
             momentum=momentum,
-            nesterov=nesterov,
             weight_decay=weight_decay,
+            nesterov=nesterov,
+            newton_schulz_steps=newton_schulz_steps,
             qk_clip_tau=qk_clip_tau,
-            qk_clip_enabled=qk_clip_enabled,
-            newton_schulz_steps=newton_schulz_steps
+            qk_clip_enabled=qk_clip_enabled
         )
         super().__init__(params, defaults)
+        
         self.max_logits_history = []
     
-    @torch.no_grad()
-    def newton_schulz(self, G, steps=5):
+    def newton_schulz(self, G, steps=5, eps=1e-7):
         a, b, c = (3.4445, -4.7750, 2.0315)
-        X = G.bfloat16() / (G.norm() + 1e-7)
+        X = G.bfloat16() / (G.norm() + eps)
         
         if G.size(0) > G.size(1):
             X = X.T
@@ -58,6 +60,14 @@ class MuonClip(Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        
+        if max_logits is not None:
+            if not isinstance(max_logits, (int, float)):
+                raise TypeError(f"max_logits must be a number, got {type(max_logits)}")
+            if math.isnan(max_logits) or math.isinf(max_logits):
+                raise ValueError(f"max_logits is invalid: {max_logits}")
+            if max_logits < 0:
+                raise ValueError(f"max_logits must be non-negative, got {max_logits}")
         
         if max_logits is not None and self.defaults['qk_clip_enabled']:
             self.max_logits_history.append(max_logits)
