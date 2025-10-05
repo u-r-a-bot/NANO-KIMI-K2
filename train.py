@@ -122,11 +122,9 @@ class Trainer:
         if checkpoint_type == 'best':
             checkpoint_path = self.checkpoint_dir / 'best_model.pt'
             console.print(f"[green]Saving best model (loss: {self.best_loss:.4f})[/green]")
-        elif checkpoint_type == 'final':
-            checkpoint_path = self.checkpoint_dir / 'final_model.pt'
-            console.print("[green]Saving final model[/green]")
         else:
-            checkpoint_path = self.checkpoint_dir / f'checkpoint_step_{self.global_step}.pt'
+            checkpoint_path = self.checkpoint_dir / 'latest_model.pt'
+            console.print(f"[green]Saving latest checkpoint at step {self.global_step}[/green]")
         
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -141,14 +139,10 @@ class Trainer:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         torch.save(checkpoint, checkpoint_path)
-        console.print(f"[green]Checkpoint saved at step {self.global_step}[/green]")
     
     def load_checkpoint(self, checkpoint_path: Optional[str] = None):
         if checkpoint_path is None:
-            latest_checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_step_*.pt'))
-            if not latest_checkpoints:
-                return False
-            checkpoint_path = latest_checkpoints[-1]
+            checkpoint_path = self.checkpoint_dir / 'latest_model.pt'
         
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
@@ -239,36 +233,24 @@ class Trainer:
             console.print(f"[green]Metrics plot saved to {self.log_dir / 'training_metrics.png'}[/green]")
         except Exception as e:
             console.print(f"[red]Error plotting metrics: {e}[/red]")
-        finally:
-            plt.close(fig)
-            plt.close('all')
     
     def cleanup_resources(self):
-        console.print("[yellow]Cleaning up resources...[/yellow]")
-        
-        plt.close('all')
-        
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        
-        del self.optimizer
-        if self.scaler is not None:
-            del self.scaler
-        
-        gc.collect()
-        
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()
-        
-        console.print("[green]Resources cleaned up[/green]")
+        try:
+            if hasattr(self, 'scaler'):
+                del self.scaler
+            if hasattr(self, 'optimizer'):
+                del self.optimizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            console.print(f"[red]Error cleaning up: {e}[/red]")
     
     def train(self):
-        self.model.train()
-        
-        panel = Panel.fit(
-            f"[bold green]Starting Training[/bold green]\n"
-            f"Max Steps: {self.max_steps:,}\n"
+        console.print(Panel.fit(
+            f"[bold cyan]Training Configuration[/bold cyan]\n"
+            f"Steps: {self.max_steps:,}\n"
+            f"Learning Rate: {self.learning_rate}\n"
             f"Batch Size: {self.train_loader.batch_size}\n"
             f"Learning Rate: {self.learning_rate}\n"
             f"Momentum: {self.momentum}\n"
@@ -276,17 +258,17 @@ class Trainer:
             f"QK-Clip Tau: {self.qk_clip_tau}\n"
             f"Gradient Accumulation: {self.gradient_accumulation_steps}\n"
             f"Device: {self.device}\n"
-            f"Mixed Precision: {self.mixed_precision}",
-            title="Training Configuration",
-            border_style="green"
-        )
-        console.print(panel)
+            f"Mixed Precision: {self.use_amp}",
+            title="Trainer",
+            border_style="cyan"
+        ))
         
+        self.model.train()
         accumulated_loss = 0
         accumulation_counter = 0
         training_completed = False
         
-        with Progress(
+        progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -294,91 +276,84 @@ class Trainer:
             TimeElapsedColumn(),
             TimeRemainingColumn(),
             console=console
-        ) as progress:
-            train_task = progress.add_task("[cyan]Training...", total=self.max_steps)
+        )
+        
+        with progress:
+            task = progress.add_task("[cyan]Training...", total=self.max_steps)
+            progress.update(task, completed=self.global_step)
             
-            data_iter = iter(self.train_loader)
-            
-            while self.global_step < self.max_steps:
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(self.train_loader)
-                    batch = next(data_iter)
-                    self.epoch += 1
+            for epoch in range(10000):
+                self.epoch = epoch
                 
-                input_ids = batch['input_ids'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                
-                if self.use_amp:
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                for batch_idx, batch in enumerate(self.train_loader):
+                    input_ids = batch['input_ids'].to(self.device)
+                    labels = batch['labels'].to(self.device)
+                    
+                    if self.use_amp:
+                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                            logits = self.model(input_ids, start_pos=0, use_cache=False)
+                            loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+                            loss = loss / self.gradient_accumulation_steps
+                    else:
                         logits = self.model(input_ids, start_pos=0, use_cache=False)
                         loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-                else:
-                    logits = self.model(input_ids, start_pos=0, use_cache=False)
-                    loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-                
-                loss = loss / self.gradient_accumulation_steps
-                
-                if self.scaler:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                accumulated_loss += loss.item()
-                accumulation_counter += 1
-                
-                if accumulation_counter >= self.gradient_accumulation_steps:
-                    max_logits = self.compute_max_logits(logits)
+                        loss = loss / self.gradient_accumulation_steps
                     
-                    if self.scaler:
-                        self.scaler.unscale_(self.optimizer)
-                    
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    
-                    lr = self.update_lr()
-                    
-                    if self.scaler:
-                        self.scaler.step(self.optimizer, max_logits=max_logits)
-                        self.scaler.update()
+                    if self.use_amp:
+                        self.scaler.scale(loss).backward()
                     else:
-                        self.optimizer.step(max_logits=max_logits)
+                        loss.backward()
                     
-                    self.optimizer.zero_grad()
+                    accumulated_loss += loss.item()
+                    accumulation_counter += 1
                     
-                    self.metrics['steps'].append(self.global_step)
-                    self.metrics['train_loss'].append(accumulated_loss)
-                    self.metrics['learning_rate'].append(lr)
-                    self.metrics['grad_norm'].append(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
-                    
-                    if self.global_step % 10 == 0:
-                        progress.update(
-                            train_task,
-                            completed=self.global_step,
-                            description=f"[cyan]Training... Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}"
-                        )
-                    
-                    accumulated_loss = 0
-                    accumulation_counter = 0
-                    self.global_step += 1
-                    
-                    if self.global_step % self.eval_interval == 0:
-                        val_loss = self.evaluate()
-                        if val_loss is not None:
-                            self.metrics['val_loss'].append(val_loss)
-                            self.metrics['val_steps'].append(self.global_step)
-                            console.print(f"[blue]Step {self.global_step} | Val Loss: {val_loss:.4f}[/blue]")
-                            
-                            if val_loss < self.best_loss:
-                                self.best_loss = val_loss
-                                self.save_checkpoint('best')
-                    
-                    if self.global_step % self.save_interval == 0:
-                        self.save_checkpoint('latest')
-                    
-                    if self.global_step >= self.max_steps:
-                        training_completed = True
-                        break
+                    if accumulation_counter >= self.gradient_accumulation_steps:
+                        if self.use_amp:
+                            self.scaler.unscale_(self.optimizer)
+                        
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        
+                        if self.use_amp:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
+                        
+                        self.optimizer.zero_grad()
+                        
+                        lr = self.update_lr()
+                        
+                        self.metrics['steps'].append(self.global_step)
+                        self.metrics['train_loss'].append(accumulated_loss)
+                        self.metrics['learning_rate'].append(lr)
+                        self.metrics['grad_norm'].append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+                        
+                        progress.update(task, completed=self.global_step, description=f"Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}")
+                        
+                        accumulated_loss = 0
+                        accumulation_counter = 0
+                        self.global_step += 1
+                        
+                        if self.global_step % self.eval_interval == 0:
+                            val_loss = self.evaluate()
+                            if val_loss is not None:
+                                self.metrics['val_loss'].append(val_loss)
+                                self.metrics['val_steps'].append(self.global_step)
+                                console.print(f"[blue]Step {self.global_step} | Val Loss: {val_loss:.4f}[/blue]")
+                                
+                                if val_loss < self.best_loss:
+                                    self.best_loss = val_loss
+                                    self.save_checkpoint('best')
+                        
+                        if self.global_step % self.save_interval == 0:
+                            self.save_checkpoint('latest')
+                        
+                        if self.global_step >= self.max_steps:
+                            training_completed = True
+                            break
+                
+                if training_completed:
+                    break
         
         final_val_loss = self.evaluate()
         
@@ -392,7 +367,7 @@ class Trainer:
             border_style="green"
         ))
         
-        self.save_checkpoint('final')
+        self.save_checkpoint('latest')
         self.plot_metrics()
         
         with open(self.log_dir / 'training_metrics.json', 'w') as f:
@@ -444,6 +419,7 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        console.print("[green]Tokenizer loaded successfully[/green]")
     except Exception as e:
         console.print(f"[red]Error loading tokenizer: {e}[/red]")
         return 1
