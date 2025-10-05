@@ -51,14 +51,12 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         mixed_precision: bool = True,
-        dtype: torch.dtype = torch.float32,
         qk_clip_tau: float = 100.0
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = torch.device(device)
-        self.dtype = dtype
         self.model.to(self.device)
         
         self.learning_rate = learning_rate
@@ -128,7 +126,7 @@ class Trainer:
             checkpoint_path = self.checkpoint_dir / 'final_model.pt'
             console.print("[green]Saving final model[/green]")
         else:
-            checkpoint_path = self.checkpoint_dir / 'latest_checkpoint.pt'
+            checkpoint_path = self.checkpoint_dir / f'checkpoint_step_{self.global_step}.pt'
         
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
@@ -136,45 +134,41 @@ class Trainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
             'best_loss': self.best_loss,
-            'metrics': self.metrics
+            'metrics': self.metrics,
         }
         
-        if self.scaler is not None:
+        if self.scaler:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         torch.save(checkpoint, checkpoint_path)
-        
-        if checkpoint_type == 'latest':
-            console.print(f"[cyan]Checkpoint saved at step {self.global_step}[/cyan]")
+        console.print(f"[green]Checkpoint saved at step {self.global_step}[/green]")
     
     def load_checkpoint(self, checkpoint_path: Optional[str] = None):
         if checkpoint_path is None:
-            checkpoint_path = self.checkpoint_dir / 'latest_checkpoint.pt'
-        else:
-            checkpoint_path = Path(checkpoint_path)
+            latest_checkpoints = sorted(self.checkpoint_dir.glob('checkpoint_step_*.pt'))
+            if not latest_checkpoints:
+                return False
+            checkpoint_path = latest_checkpoints[-1]
         
+        checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
-            console.print(f"[yellow]No checkpoint found at {checkpoint_path}[/yellow]")
             return False
         
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.global_step = checkpoint['global_step']
-            self.epoch = checkpoint['epoch']
-            self.best_loss = checkpoint['best_loss']
-            self.metrics = checkpoint['metrics']
-            
-            if self.scaler is not None and 'scaler_state_dict' in checkpoint:
-                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
-            console.print(f"[green]Checkpoint loaded from: {checkpoint_path}[/green]")
-            console.print(f"[cyan]Resuming from step {self.global_step}, epoch {self.epoch}[/cyan]")
-            return True
-        except Exception as e:
-            console.print(f"[red]Error loading checkpoint: {e}[/red]")
-            return False
+        console.print(f"[yellow]Loading checkpoint from {checkpoint_path}[/yellow]")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.global_step = checkpoint['global_step']
+        self.epoch = checkpoint['epoch']
+        self.best_loss = checkpoint['best_loss']
+        self.metrics = checkpoint['metrics']
+        
+        if self.scaler and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        console.print(f"[green]Resumed from step {self.global_step}[/green]")
+        return True
     
     @torch.no_grad()
     def evaluate(self):
@@ -185,29 +179,23 @@ class Trainer:
         total_loss = 0
         num_batches = 0
         
-        try:
-            for batch in self.val_loader:
-                input_ids = batch['input_ids'].to(self.device)
-                labels = batch['labels'].to(self.device)
-                
+        for batch in self.val_loader:
+            input_ids = batch['input_ids'].to(self.device)
+            labels = batch['labels'].to(self.device)
+            
+            if self.use_amp:
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = self.model(input_ids, start_pos=0, use_cache=False)
+                    loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+            else:
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
                 loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-                
-                total_loss += loss.item()
-                num_batches += 1
-                
-                if num_batches >= 10:
-                    break
-        except Exception as e:
-            console.print(f"[red]Evaluation error: {e}[/red]")
-            return None
-        finally:
-            self.model.train()
+            
+            total_loss += loss.item()
+            num_batches += 1
         
-        if num_batches == 0:
-            return None
-        
-        return total_loss / num_batches
+        self.model.train()
+        return total_loss / num_batches if num_batches > 0 else None
     
     def plot_metrics(self):
         if not self.metrics['steps']:
@@ -216,24 +204,29 @@ class Trainer:
         try:
             fig, axes = plt.subplots(2, 2, figsize=(15, 10))
             
-            axes[0, 0].plot(self.metrics['steps'], self.metrics['train_loss'])
+            axes[0, 0].plot(self.metrics['steps'], self.metrics['train_loss'], label='Train Loss', alpha=0.7)
+            if self.metrics['val_loss']:
+                axes[0, 0].plot(self.metrics['val_steps'], self.metrics['val_loss'], label='Val Loss', alpha=0.7)
             axes[0, 0].set_xlabel('Steps')
-            axes[0, 0].set_ylabel('Train Loss')
+            axes[0, 0].set_ylabel('Loss')
             axes[0, 0].set_title('Training Loss')
+            axes[0, 0].legend()
             axes[0, 0].grid(True)
             
-            if self.metrics['val_loss'] and self.metrics['val_steps']:
-                axes[0, 1].plot(self.metrics['val_steps'], self.metrics['val_loss'])
-                axes[0, 1].set_xlabel('Steps')
-                axes[0, 1].set_ylabel('Validation Loss')
-                axes[0, 1].set_title('Validation Loss')
-                axes[0, 1].grid(True)
+            axes[0, 1].plot(self.metrics['steps'], self.metrics['learning_rate'])
+            axes[0, 1].set_xlabel('Steps')
+            axes[0, 1].set_ylabel('Learning Rate')
+            axes[0, 1].set_title('Learning Rate Schedule')
+            axes[0, 1].grid(True)
             
-            axes[1, 0].plot(self.metrics['steps'], self.metrics['learning_rate'])
-            axes[1, 0].set_xlabel('Steps')
-            axes[1, 0].set_ylabel('Learning Rate')
-            axes[1, 0].set_title('Learning Rate Schedule')
-            axes[1, 0].grid(True)
+            if len(self.metrics['train_loss']) > 50:
+                window = 50
+                smoothed_loss = np.convolve(self.metrics['train_loss'], np.ones(window)/window, mode='valid')
+                axes[1, 0].plot(self.metrics['steps'][:len(smoothed_loss)], smoothed_loss)
+                axes[1, 0].set_xlabel('Steps')
+                axes[1, 0].set_ylabel('Smoothed Loss')
+                axes[1, 0].set_title('Smoothed Training Loss')
+                axes[1, 0].grid(True)
             
             axes[1, 1].plot(self.metrics['steps'], self.metrics['grad_norm'])
             axes[1, 1].set_xlabel('Steps')
@@ -356,13 +349,14 @@ class Trainer:
                     self.metrics['steps'].append(self.global_step)
                     self.metrics['train_loss'].append(accumulated_loss)
                     self.metrics['learning_rate'].append(lr)
-                    self.metrics['grad_norm'].append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
+                    self.metrics['grad_norm'].append(grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm)
                     
-                    progress.update(
-                        train_task,
-                        advance=1,
-                        description=f"[cyan]Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}"
-                    )
+                    if self.global_step % 10 == 0:
+                        progress.update(
+                            train_task,
+                            completed=self.global_step,
+                            description=f"[cyan]Training... Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}"
+                        )
                     
                     accumulated_loss = 0
                     accumulation_counter = 0
@@ -373,7 +367,7 @@ class Trainer:
                         if val_loss is not None:
                             self.metrics['val_loss'].append(val_loss)
                             self.metrics['val_steps'].append(self.global_step)
-                            console.print(f"[yellow]Step {self.global_step} | Val Loss: {val_loss:.4f}[/yellow]")
+                            console.print(f"[blue]Step {self.global_step} | Val Loss: {val_loss:.4f}[/blue]")
                             
                             if val_loss < self.best_loss:
                                 self.best_loss = val_loss
@@ -387,16 +381,9 @@ class Trainer:
                         break
         
         final_val_loss = self.evaluate()
-        if final_val_loss is not None:
-            self.metrics['val_loss'].append(final_val_loss)
-            self.metrics['val_steps'].append(self.global_step)
-            
-            if final_val_loss < self.best_loss:
-                self.best_loss = final_val_loss
-                self.save_checkpoint('best')
         
         console.print(Panel.fit(
-            f"[bold green]Training Complete![/bold green]\n"
+            f"[bold green]Training Complete[/bold green]\n"
             f"Total Steps: {self.global_step:,}\n"
             f"Final Val Loss: {final_val_loss if final_val_loss is not None else 'N/A'}\n"
             f"Best Loss: {self.best_loss:.4f}\n"
@@ -511,17 +498,10 @@ def main():
     console.print("[yellow]Initializing model...[/yellow]")
     model = Transformer(config)
     
-    dtype = torch.float32
-    if args.mixed_precision and args.device == 'cuda':
-        dtype = torch.float16
-        model = model.to(dtype=torch.float16)
-        console.print("[green]Using float16 precision on CUDA[/green]")
-    elif args.device == 'mps':
-        model = model.to(dtype=torch.float32)
-        console.print("[green]Using float32 precision on MPS[/green]")
+    if args.mixed_precision:
+        console.print("[green]Mixed precision enabled - using autocast[/green]")
     else:
-        model = model.to(dtype=torch.float32)
-        console.print("[green]Using float32 precision on CPU[/green]")
+        console.print("[green]Using full precision (float32)[/green]")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -546,7 +526,6 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         max_grad_norm=args.max_grad_norm,
         mixed_precision=args.mixed_precision,
-        dtype=dtype,
         qk_clip_tau=args.qk_clip_tau
     )
     
