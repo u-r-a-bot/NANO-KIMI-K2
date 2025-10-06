@@ -21,7 +21,7 @@ def load_model(checkpoint_path: str, device: str = None):
     
     model = Transformer(config).to(device).to(dtype)
     
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     

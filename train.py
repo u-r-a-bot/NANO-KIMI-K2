@@ -14,6 +14,8 @@ matplotlib.use('Agg')
 from typing import Optional, Dict, List
 import argparse
 import gc
+import atexit
+import signal
 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -72,22 +74,22 @@ class Trainer:
         
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        param_groups = get_muon_param_groups(self.model, lr=learning_rate, weight_decay=weight_decay)
+        param_groups = get_muon_param_groups(self.model, lr=self.learning_rate, weight_decay=self.weight_decay)
         self.optimizer = MuonClip(
             param_groups,
-            lr=learning_rate,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            qk_clip_tau=qk_clip_tau,
+            lr=self.learning_rate,
+            momentum=self.momentum,
+            weight_decay=self.weight_decay,
+            qk_clip_tau=self.qk_clip_tau,
             qk_clip_enabled=True
         )
         
-        self.mixed_precision = mixed_precision and device == 'cuda'
-        self.use_amp = self.mixed_precision
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        self.mixed_precision = mixed_precision and self.device.type == 'cuda'
+        self.scaler = torch.amp.GradScaler('cuda') if self.mixed_precision else None
         
         self.global_step = 0
         self.epoch = 0
@@ -102,69 +104,47 @@ class Trainer:
             'learning_rate': [],
             'grad_norm': []
         }
-    
-    def compute_max_logits(self, logits: torch.Tensor) -> float:
-        return logits.abs().max().item()
-    
-    def update_lr(self):
-        if self.global_step < self.warmup_steps:
-            lr = self.learning_rate * (self.global_step + 1) / self.warmup_steps
-        else:
-            progress = (self.global_step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
-            lr = self.learning_rate * 0.5 * (1 + np.cos(np.pi * progress))
         
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        return lr
+        self.data_iter = None
+        self.progress = None
     
-    def save_checkpoint(self, checkpoint_type='latest'):
-        if checkpoint_type == 'best':
-            checkpoint_path = self.checkpoint_dir / 'best_model.pt'
-            console.print(f"[green]Saving best model (loss: {self.best_loss:.4f})[/green]")
-        else:
-            checkpoint_path = self.checkpoint_dir / 'latest_model.pt'
-            console.print(f"[green]Saving latest checkpoint at step {self.global_step}[/green]")
-        
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+    def get_lr(self, step: int) -> float:
+        if step < self.warmup_steps:
+            return self.learning_rate * step / self.warmup_steps
+        return self.learning_rate
+    
+    def save_checkpoint(self, name: str = 'latest'):
+        checkpoint_path = self.checkpoint_dir / f'{name}.pt'
+        torch.save({
             'global_step': self.global_step,
             'epoch': self.epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
             'best_loss': self.best_loss,
             'metrics': self.metrics,
-        }
-        
-        if self.scaler:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-        
-        torch.save(checkpoint, checkpoint_path)
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler is not None else None
+        }, checkpoint_path)
+        console.print(f"[green]Checkpoint saved: {checkpoint_path}[/green]")
     
-    def load_checkpoint(self, checkpoint_path: Optional[str] = None):
-        if checkpoint_path is None:
-            checkpoint_path = self.checkpoint_dir / 'latest_model.pt'
-        
-        checkpoint_path = Path(checkpoint_path)
-        if not checkpoint_path.exists():
+    def load_checkpoint(self, checkpoint_path: str) -> bool:
+        if checkpoint_path is None or not Path(checkpoint_path).exists():
             return False
         
-        console.print(f"[yellow]Loading checkpoint from {checkpoint_path}[/yellow]")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
-        self.best_loss = checkpoint['best_loss']
-        self.metrics = checkpoint['metrics']
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
+        self.metrics = checkpoint.get('metrics', self.metrics)
         
-        if self.scaler and 'scaler_state_dict' in checkpoint:
+        if self.scaler is not None and checkpoint.get('scaler_state_dict') is not None:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
-        console.print(f"[green]Resumed from step {self.global_step}[/green]")
+        console.print(f"[green]Checkpoint loaded: {checkpoint_path}[/green]")
+        console.print(f"[cyan]Resuming from step {self.global_step}, epoch {self.epoch}[/cyan]")
         return True
     
-    @torch.no_grad()
     def evaluate(self):
         if self.val_loader is None:
             return None
@@ -173,20 +153,16 @@ class Trainer:
         total_loss = 0
         num_batches = 0
         
-        for batch in self.val_loader:
-            input_ids = batch['input_ids'].to(self.device)
-            labels = batch['labels'].to(self.device)
-            
-            if self.use_amp:
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    logits = self.model(input_ids, start_pos=0, use_cache=False)
-                    loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-            else:
+        with torch.no_grad():
+            for batch in self.val_loader:
+                input_ids = batch['input_ids'].to(self.device)
+                labels = batch['labels'].to(self.device)
+                
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
                 loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-            
-            total_loss += loss.item()
-            num_batches += 1
+                
+                total_loss += loss.item()
+                num_batches += 1
         
         self.model.train()
         return total_loss / num_batches if num_batches > 0 else None
@@ -233,24 +209,51 @@ class Trainer:
             console.print(f"[green]Metrics plot saved to {self.log_dir / 'training_metrics.png'}[/green]")
         except Exception as e:
             console.print(f"[red]Error plotting metrics: {e}[/red]")
+        finally:
+            plt.close(fig)
+            plt.close('all')
     
     def cleanup_resources(self):
+        console.print("[yellow]Cleaning up trainer resources...[/yellow]")
+        
+        if self.data_iter is not None:
+            try:
+                del self.data_iter
+            except:
+                pass
+            self.data_iter = None
+        
+        plt.close('all')
+        
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
         try:
-            if hasattr(self, 'scaler'):
+            del self.optimizer
+        except:
+            pass
+        
+        if self.scaler is not None:
+            try:
                 del self.scaler
-            if hasattr(self, 'optimizer'):
-                del self.optimizer
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as e:
-            console.print(f"[red]Error cleaning up: {e}[/red]")
+            except:
+                pass
+            self.scaler = None
+        
+        gc.collect()
+        
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        console.print("[green]Trainer resources cleaned up[/green]")
     
     def train(self):
-        console.print(Panel.fit(
-            f"[bold cyan]Training Configuration[/bold cyan]\n"
-            f"Steps: {self.max_steps:,}\n"
-            f"Learning Rate: {self.learning_rate}\n"
+        self.model.train()
+        
+        panel = Panel.fit(
+            f"[bold green]Starting Training[/bold green]\n"
+            f"Max Steps: {self.max_steps:,}\n"
             f"Batch Size: {self.train_loader.batch_size}\n"
             f"Learning Rate: {self.learning_rate}\n"
             f"Momentum: {self.momentum}\n"
@@ -258,17 +261,17 @@ class Trainer:
             f"QK-Clip Tau: {self.qk_clip_tau}\n"
             f"Gradient Accumulation: {self.gradient_accumulation_steps}\n"
             f"Device: {self.device}\n"
-            f"Mixed Precision: {self.use_amp}",
-            title="Trainer",
-            border_style="cyan"
-        ))
+            f"Mixed Precision: {self.mixed_precision}",
+            title="Training Configuration",
+            border_style="green"
+        )
+        console.print(panel)
         
-        self.model.train()
         accumulated_loss = 0
         accumulation_counter = 0
         training_completed = False
         
-        progress = Progress(
+        self.progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -278,57 +281,69 @@ class Trainer:
             console=console
         )
         
-        with progress:
-            task = progress.add_task("[cyan]Training...", total=self.max_steps)
-            progress.update(task, completed=self.global_step)
-            
-            for epoch in range(10000):
-                self.epoch = epoch
+        try:
+            with self.progress:
+                train_task = self.progress.add_task("[cyan]Training...", total=self.max_steps)
                 
-                for batch_idx, batch in enumerate(self.train_loader):
+                self.data_iter = iter(self.train_loader)
+                
+                while self.global_step < self.max_steps:
+                    try:
+                        batch = next(self.data_iter)
+                    except StopIteration:
+                        if self.data_iter is not None:
+                            del self.data_iter
+                        self.data_iter = iter(self.train_loader)
+                        batch = next(self.data_iter)
+                        self.epoch += 1
+                    
                     input_ids = batch['input_ids'].to(self.device)
                     labels = batch['labels'].to(self.device)
                     
-                    if self.use_amp:
-                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    if self.mixed_precision:
+                        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                             logits = self.model(input_ids, start_pos=0, use_cache=False)
                             loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
-                            loss = loss / self.gradient_accumulation_steps
+                        loss = loss / self.gradient_accumulation_steps
+                        self.scaler.scale(loss).backward()
                     else:
                         logits = self.model(input_ids, start_pos=0, use_cache=False)
                         loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
                         loss = loss / self.gradient_accumulation_steps
-                    
-                    if self.use_amp:
-                        self.scaler.scale(loss).backward()
-                    else:
                         loss.backward()
                     
+                    max_logits = logits.abs().max().item()
                     accumulated_loss += loss.item()
                     accumulation_counter += 1
                     
                     if accumulation_counter >= self.gradient_accumulation_steps:
-                        if self.use_amp:
+                        if self.mixed_precision:
                             self.scaler.unscale_(self.optimizer)
                         
                         grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         
-                        if self.use_amp:
-                            self.scaler.step(self.optimizer)
+                        if self.mixed_precision:
+                            self.scaler.step(self.optimizer, max_logits=max_logits)
                             self.scaler.update()
                         else:
-                            self.optimizer.step()
+                            self.optimizer.step(max_logits=max_logits)
                         
-                        self.optimizer.zero_grad()
+                        self.optimizer.zero_grad(set_to_none=True)
                         
-                        lr = self.update_lr()
+                        lr = self.get_lr(self.global_step)
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = lr
                         
                         self.metrics['steps'].append(self.global_step)
                         self.metrics['train_loss'].append(accumulated_loss)
                         self.metrics['learning_rate'].append(lr)
                         self.metrics['grad_norm'].append(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
                         
-                        progress.update(task, completed=self.global_step, description=f"Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}")
+                        self.progress.update(
+                            train_task,
+                            advance=1,
+                            description=f"[cyan]Step {self.global_step}/{self.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.6f}"
+                        )
                         
                         accumulated_loss = 0
                         accumulation_counter = 0
@@ -351,9 +366,10 @@ class Trainer:
                         if self.global_step >= self.max_steps:
                             training_completed = True
                             break
-                
-                if training_completed:
-                    break
+        finally:
+            if self.data_iter is not None:
+                del self.data_iter
+                self.data_iter = None
         
         final_val_loss = self.evaluate()
         
@@ -367,7 +383,7 @@ class Trainer:
             border_style="green"
         ))
         
-        self.save_checkpoint('latest')
+        self.save_checkpoint('final')
         self.plot_metrics()
         
         with open(self.log_dir / 'training_metrics.json', 'w') as f:
@@ -377,7 +393,21 @@ class Trainer:
         
         return training_completed
 
+def cleanup_handler(signum=None, frame=None):
+    console.print("\n[yellow]Cleaning up before exit...[/yellow]")
+    plt.close('all')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    gc.collect()
+    console.print("[green]Cleanup complete[/green]")
+    sys.exit(0)
+
 def main():
+    signal.signal(signal.SIGINT, cleanup_handler)
+    signal.signal(signal.SIGTERM, cleanup_handler)
+    atexit.register(cleanup_handler)
+    
     parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
     parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local'])
     parser.add_argument('--data_path', type=str, default='data/train.txt')
@@ -419,14 +449,14 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        console.print("[green]Tokenizer loaded successfully[/green]")
     except Exception as e:
         console.print(f"[red]Error loading tokenizer: {e}[/red]")
-        return 1
+        sys.exit(1)
     
     config.vocab_size = len(tokenizer)
     
     console.print("[yellow]Loading dataset...[/yellow]")
+    dataset = None
     try:
         if args.dataset == 'fineweb':
             dataset = FineWebDataset(
@@ -452,7 +482,7 @@ def main():
             )
     except Exception as e:
         console.print(f"[red]Error loading dataset: {e}[/red]")
-        return 1
+        sys.exit(1)
     
     collator = DataCollator(tokenizer.pad_token_id)
     
@@ -463,7 +493,8 @@ def main():
         num_workers=0 if args.dataset == 'streaming' else 2,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collator,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=False
     )
     
     if hasattr(dataset, '__len__'):
@@ -533,11 +564,41 @@ def main():
         elif not exception_occurred:
             console.print("[yellow]Training ended before completion[/yellow]")
         
+        console.print("[yellow]Final cleanup...[/yellow]")
+        
+        try:
+            if hasattr(dataloader, '_iterator') and dataloader._iterator is not None:
+                del dataloader._iterator
+        except:
+            pass
+        
+        try:
+            trainer.cleanup_resources()
+        except:
+            pass
+        
         try:
             del trainer
+        except:
+            pass
+        
+        try:
             del model
+        except:
+            pass
+        
+        try:
             del dataloader
+        except:
+            pass
+        
+        try:
             del dataset
+        except:
+            pass
+        
+        try:
+            del tokenizer
         except:
             pass
         
@@ -547,10 +608,13 @@ def main():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
+        plt.close('all')
+        
         console.print("[cyan]All resources cleaned up[/cyan]")
     
-    return 0 if training_success else 1
+    exit_code = 0 if training_success else 1
+    console.print(f"[cyan]Exiting with code {exit_code}[/cyan]")
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
-    exit_code = main()
-    sys.exit(exit_code)
+    main()

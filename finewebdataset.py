@@ -85,9 +85,10 @@ class FineWebStreamingDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.buffer_size = buffer_size
-        self.samples_processed = 0
     
     def __iter__(self):
+        samples_processed = 0  # ← FIXED: Local variable, resets each epoch
+        
         dataset = load_dataset(
             "HuggingFaceFW/fineweb",
             name="sample-10BT",
@@ -99,7 +100,7 @@ class FineWebStreamingDataset(IterableDataset):
         buffer = []
         
         for example in dataset:
-            if self.num_samples and self.samples_processed >= self.num_samples:
+            if self.num_samples and samples_processed >= self.num_samples:
                 break
             
             text = example.get('text', '')
@@ -122,7 +123,7 @@ class FineWebStreamingDataset(IterableDataset):
             }
             
             buffer.append(sample)
-            self.samples_processed += 1
+            samples_processed += 1  # ← Now increments local variable
             
             if len(buffer) >= self.buffer_size:
                 np.random.shuffle(buffer)
