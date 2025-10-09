@@ -64,7 +64,7 @@ class Config:
     
     n_routed_experts: int = 8
     n_activated_experts: int = 2
-    n_expert_groups: int = 4
+    n_expert_groups: int = 1
     n_shared_experts: int = 2
     
     score_func: Literal["softmax", "sigmoid"] = "softmax"
