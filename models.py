@@ -197,7 +197,7 @@ class MLA(nn.Module):
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=0.0,
-            is_causal=(mask is None)  # if no mask provided, assume causal
+#            is_causal=(mask is None)  # if no mask provided, assume causal
         )  # -> (B, H, L, D)
 
         # --- Project output ---
@@ -341,7 +341,7 @@ class Transformer(nn.Module):
         
         mask = None
         if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu(1)
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device,dtype=h.dtype).triu(1)
         
         for layer in self.layers:
             h = layer(h, start_pos, input_pos, mask, use_cache=use_cache)
