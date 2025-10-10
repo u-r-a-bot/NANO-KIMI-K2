@@ -139,19 +139,26 @@ class FineWebStreamingDataset(IterableDataset):
 class DataCollator:
     def __init__(self, pad_token_id: int):
         self.pad_token_id = pad_token_id
-    
+
     def __call__(self, features: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        input_ids = torch.stack([f['input_ids'] for f in features])
-        attention_mask = torch.stack([f['attention_mask'] for f in features])
-        labels = torch.stack([f['labels'] for f in features])
-        
-        labels[attention_mask == 0] = -100
-        
+        # Stack inputs
+        input_ids = torch.stack([f['input_ids'] for f in features])         # (B, L)
+        attention_mask = torch.stack([f['attention_mask'] for f in features])  # (B, L)
+
+        # Create next-token labels: labels[:, t] = input_ids[:, t+1]
+        labels = input_ids.clone()
+        labels[:, :-1] = input_ids[:, 1:]
+        labels[:, -1] = -100  # last position has no next token target
+
+        # Mask out padding tokens (set them to -100 so cross_entropy ignores them)
+        labels = labels.masked_fill(attention_mask == 0, -100)
+
         return {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'labels': labels
         }
+
 
 def test_fineweb():
     from config import Config
