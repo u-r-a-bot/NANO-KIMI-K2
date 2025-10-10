@@ -15,6 +15,7 @@ from typing import Optional, Dict, List
 import argparse
 import gc
 import atexit
+import os
 import signal
 
 from rich.console import Console
@@ -31,6 +32,9 @@ from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
 from dataset import TextDataset, DataCollator
 from optimizer import MuonClip, get_muon_param_groups
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 
 console = Console()
 
