@@ -48,65 +48,163 @@ class RotaryPositionalEmbeddings(nn.Module):
         x_out = x_out.flatten(3)
         return x_out.type_as(x)
     
+# class MLA(nn.Module):
+#     def __init__(self, config: Config):
+#         super().__init__()
+#         self.dim = config.dim
+#         self.n_heads = config.n_heads
+#         self.qk_nope_head_dim = config.qk_nope_head_dim
+#         self.qk_rope_head_dim = config.qk_rope_head_dim
+#         self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+#         self.v_head_dim = config.v_head_dim
+        
+#         self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
+#         self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
+#         self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
+#         self.rope = RotaryPositionalEmbeddings(dim=self.qk_rope_head_dim, max_seq_len=config.max_seq_length)
+#         self.register_buffer("k_cache", torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.qk_head_dim))
+#         self.register_buffer("v_cache", torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.v_head_dim))
+#         self.softmax_scale = self.qk_head_dim ** -0.5
+#         self.c_v_linear = nn.Linear(in_features=self.n_heads * self.v_head_dim, out_features=self.dim)
+
+#     def forward(self, x: torch.Tensor, start_pos: int, input_pos: Optional[torch.Tensor], mask: Optional[torch.Tensor], use_cache: bool = False):
+#         b, seq_len, _ = x.size()
+        
+#         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
+#         k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim) 
+#         v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
+        
+#         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+#         k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        
+#         q_rope = self.rope(q_rope, input_pos=input_pos)
+#         k_rope = self.rope(k_rope, input_pos=input_pos)
+
+#         q = torch.cat([q_nope, q_rope], dim=-1)
+#         k = torch.cat([k_nope, k_rope], dim=-1)
+
+#         if use_cache:
+#             end_pos = start_pos + seq_len
+#             self.k_cache[:b, start_pos:end_pos] = k
+#             self.v_cache[:b, start_pos:end_pos] = v
+            
+#             cached_k = self.k_cache[:b, :end_pos]
+#             cached_v = self.v_cache[:b, :end_pos]
+            
+#             scores = torch.einsum("bshd,bthd->bsht", q, cached_k) * self.softmax_scale
+#         else:
+#             scores = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
+
+#         if mask is not None:
+#             scores = scores + mask.unsqueeze(1)
+
+#         weights = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        
+#         if use_cache:
+#             c_v = torch.einsum("bsht,bthd->bshd", weights, cached_v)
+#         else:
+#             c_v = torch.einsum("bsht,bthd->bshd", weights, v)
+        
+#         return self.c_v_linear(c_v.flatten(2))
+
+
 class MLA(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self, config):
         super().__init__()
         self.dim = config.dim
         self.n_heads = config.n_heads
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
-        
+
+        # Linear projections
         self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
         self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
         self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
-        self.rope = RotaryPositionalEmbeddings(dim=self.qk_rope_head_dim, max_seq_len=config.max_seq_length)
-        self.register_buffer("k_cache", torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.qk_head_dim))
-        self.register_buffer("v_cache", torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.v_head_dim))
-        self.softmax_scale = self.qk_head_dim ** -0.5
-        self.c_v_linear = nn.Linear(in_features=self.n_heads * self.v_head_dim, out_features=self.dim)
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_pos: Optional[torch.Tensor], mask: Optional[torch.Tensor], use_cache: bool = False):
+        # Rotary embeddings for positional encoding
+        self.rope = RotaryPositionalEmbeddings(
+            dim=self.qk_rope_head_dim,
+            max_seq_len=config.max_seq_length
+        )
+
+        # Caches for efficient autoregressive inference
+        self.register_buffer(
+            "k_cache",
+            torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.qk_head_dim)
+        )
+        self.register_buffer(
+            "v_cache",
+            torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.v_head_dim)
+        )
+
+        self.softmax_scale = self.qk_head_dim ** -0.5
+        self.c_v_linear = nn.Linear(
+            in_features=self.n_heads * self.v_head_dim,
+            out_features=self.dim
+        )
+
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        input_pos: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+        use_cache: bool = False
+    ):
         b, seq_len, _ = x.size()
-        
+
+        # --- Projections ---
         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
-        k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim) 
+        k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
         v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
-        
+
+        # --- Rotary embeddings ---
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        
+
         q_rope = self.rope(q_rope, input_pos=input_pos)
         k_rope = self.rope(k_rope, input_pos=input_pos)
 
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
 
+        # --- KV caching ---
+        end_pos = start_pos + seq_len
         if use_cache:
-            end_pos = start_pos + seq_len
             self.k_cache[:b, start_pos:end_pos] = k
             self.v_cache[:b, start_pos:end_pos] = v
-            
-            cached_k = self.k_cache[:b, :end_pos]
-            cached_v = self.v_cache[:b, :end_pos]
-            
-            scores = torch.einsum("bshd,bthd->bsht", q, cached_k) * self.softmax_scale
-        else:
-            scores = torch.einsum("bshd,bthd->bsht", q, k) * self.softmax_scale
+            k = self.k_cache[:b, :end_pos]
+            v = self.v_cache[:b, :end_pos]
+
+        # --- Flash Attention (SDPA) ---
+        # PyTorch automatically dispatches to FlashAttention or math kernel depending on device and dtype
+        # Ensure (B, H, L, D) format for F.scaled_dot_product_attention
+        q = q.transpose(1, 2)  # (B, H, L, D)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
 
         if mask is not None:
-            scores = scores + mask.unsqueeze(1)
 
-        weights = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        
-        if use_cache:
-            c_v = torch.einsum("bsht,bthd->bshd", weights, cached_v)
+            attn_mask = mask
         else:
-            c_v = torch.einsum("bsht,bthd->bshd", weights, v)
-        
-        return self.c_v_linear(c_v.flatten(2))
-        
+            attn_mask = None
+        #print(f"q.shape = {q.shape}\n k.shape = {k.shape}\n v.shape={v.shape}\n mask.shape={mask.shape} ")
+        c_v = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=(mask is None)  # if no mask provided, assume causal
+        )  # -> (B, H, L, D)
+
+        # --- Project output ---
+        c_v = c_v.transpose(1, 2).contiguous().view(b, seq_len, -1)
+        return self.c_v_linear(c_v)
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, inter_dim: int):
         super().__init__()

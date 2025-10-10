@@ -73,7 +73,7 @@ class Config:
     moe_inter_dim: int = 1024
     inter_dim: int = 1024
     
-    n_dense_layers: int = 3
+    n_dense_layers: int = 1
     
     def __post_init__(self):
         if self.vocab_size is None:
