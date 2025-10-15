@@ -30,7 +30,7 @@ from rich import box
 from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
-from dataset import TextDataset, DataCollator, StreamingIterableDataset
+from dataset import TextDataset, DataCollator, FileStreamingIterableDataset,DirectStreamingDataset
 from optimizer import MuonClip, get_muon_param_groups
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -418,7 +418,8 @@ def main():
     atexit.register(cleanup_handler)
     
     parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
-    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local','localstreaming'])
+    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local','localstreaming','hfstreaming'])
+    parser.add_argument('--hf_repo_name',type=str,default=None)
     parser.add_argument('--data_path', type=str, default='data/train.txt')
     parser.add_argument('--num_samples', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=2)
@@ -482,11 +483,26 @@ def main():
                 tokenizer=tokenizer,
                 batch_size=args.batch_size
             )
+        elif args.dataset == 'hfstreaming':
+            if args.hf_repo_name == None:
+                raise ValueError("Dataset name not provided use \'--hf_repo_name\' argument")
+            dataset = DirectStreamingDataset(
+                dataset_name = args.hf_repo_name,
+                tokenizer=tokenizer,
+                max_length=1024,
+                stride=512,
+                hf_shuffle=True,
+                seed=42
+            )
         elif args.dataset == 'localstreaming':
-            dataset = StreamingIterableDataset(
+            dataset = FileStreamingIterableDataset(
                 file_path= args.data_path,
                 tokenizer=tokenizer,
-                
+                max_length=512,
+                stride=256,
+                shuffle_buffer_size=1000,
+                hf_shuffle=True,
+                seed=42  
             )
         else:
             dataset = TextDataset(
