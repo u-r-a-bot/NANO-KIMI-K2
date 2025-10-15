@@ -504,8 +504,8 @@ def main():
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True if args.dataset != 'streaming' else False,
-        num_workers=0 if args.dataset == 'streaming' else 2,
+        shuffle=True if 'streaming' not in args.dataset else False,
+        num_workers=0 if 'streaming' not in args.dataset else 2,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collator,
         drop_last=True,
