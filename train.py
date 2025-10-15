@@ -134,7 +134,7 @@ class Trainer:
         if checkpoint_path is None or not Path(checkpoint_path).exists():
             return False
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False,strict = False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.global_step = checkpoint['global_step']
