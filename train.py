@@ -287,8 +287,8 @@ class Trainer:
         
         try:
             with self.progress:
-                remaining_steps = self.max_steps - self.global_step
-                train_task = self.progress.add_task("[cyan]Training...", total=remaining_steps,completed=self.global_step)
+
+                train_task = self.progress.add_task("[cyan]Training...", total=self.max_steps,completed=self.global_step)
                 
                 self.data_iter = iter(self.train_loader)
                 
