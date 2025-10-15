@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import mmap
 import io
 
-class OptimizedTextDataset(Dataset):
+class TextDataset(Dataset):
     """Memory-efficient dataset with lazy loading and mmap support"""
     
     def __init__(
@@ -135,7 +135,7 @@ class OptimizedTextDataset(Dataset):
         }
 
 
-class DynamicBatchCollator:
+class DataCollator:
     """Efficient collator with dynamic padding"""
     
     def __init__(self, pad_token_id: int = 0, max_length: Optional[int] = None):
@@ -295,7 +295,7 @@ def create_optimized_dataloader(
         dataset = StreamingIterableDataset(file_path, tokenizer, max_length)
         shuffle = False
     else:
-        dataset = OptimizedTextDataset(
+        dataset = TextDataset(
             file_path, tokenizer, max_length, 
             num_workers=num_workers, **kwargs
         )
@@ -308,7 +308,7 @@ def create_optimized_dataloader(
         shuffle=shuffle if not use_streaming else False,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
-        collate_fn=DynamicBatchCollator(
+        collate_fn=DataCollator(
             tokenizer.pad_token_id,
             max_length=max_length
         ),
