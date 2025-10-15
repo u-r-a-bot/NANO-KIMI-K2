@@ -30,7 +30,7 @@ from rich import box
 from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
-from dataset import OptimizedTextDataset, DynamicBatchCollator
+from dataset import OptimizedTextDataset, DataCollator
 from optimizer import MuonClip, get_muon_param_groups
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
