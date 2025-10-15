@@ -8,7 +8,8 @@ from transformers import AutoTokenizer
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import mmap
 import io
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class TextDataset(Dataset):
     """Memory-efficient dataset with lazy loading and mmap support"""
     
@@ -183,8 +184,6 @@ class DataCollator:
 
 
 class StreamingIterableDataset(IterableDataset):
-    """True streaming dataset for very large files"""
-    
     def __init__(
         self,
         file_path: Union[str, Path],
@@ -198,38 +197,50 @@ class StreamingIterableDataset(IterableDataset):
         self.max_length = max_length
         self.buffer_size = buffer_size
         self.shuffle_buffer = shuffle_buffer
-        
         if not self.file_path.exists():
             raise FileNotFoundError(f"File not found: {self.file_path}")
-    
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
-        
+        shuffle_buf = []
         with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
             buffer = []
-            
+            line_idx = 0
             for line in f:
                 if not line.strip():
                     continue
-                
-                # Multi-worker support
-                if worker_info is not None:
-                    if random.randint(0, worker_info.num_workers - 1) != worker_info.id:
-                        continue
-                
+                if worker_info is not None and (line_idx % worker_info.num_workers) != worker_info.id:
+                    line_idx += 1
+                    continue
                 tokens = self.tokenizer.encode(line.strip(), add_special_tokens=False)
                 buffer.extend(tokens)
-                
-                # Yield samples when buffer is full
-                while len(buffer) >= self.max_length:
+                if len(buffer) >= self.max_length:
                     chunk = buffer[:self.max_length]
-                    buffer = buffer[self.max_length // 2:]  # Overlap
-                    
+                    buffer = buffer[self.max_length // 2:]
                     if len(chunk) > 1:
-                        yield {
+                        sample = {
                             'input_ids': torch.tensor(chunk[:-1], dtype=torch.long),
                             'labels': torch.tensor(chunk[1:], dtype=torch.long),
                         }
+                        shuffle_buf.append(sample)
+                        if len(shuffle_buf) >= self.shuffle_buffer:
+                            random.shuffle(shuffle_buf)
+                            for s in shuffle_buf:
+                                yield s
+                            shuffle_buf = []
+                if len(buffer) > 2 * self.max_length:
+                    buffer = buffer[-self.max_length:]
+                line_idx += 1
+            if len(buffer) > 1:
+                sample = {
+                    'input_ids': torch.tensor(buffer[:-1], dtype=torch.long),
+                    'labels': torch.tensor(buffer[1:], dtype=torch.long),
+                }
+                shuffle_buf.append(sample)
+            if shuffle_buf:
+                random.shuffle(shuffle_buf)
+                for s in shuffle_buf:
+                    yield s
 
 
 class PreloadedDataset(Dataset):
@@ -322,7 +333,7 @@ def create_optimized_dataloader(
 
 if __name__ == "__main__":
     # Example usage
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2")
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M")
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -355,15 +366,23 @@ if __name__ == "__main__":
     dataloader_stream = create_optimized_dataloader(
         "data/train.txt",
         tokenizer,
-        batch_size=8,
+        batch_size=2,
         max_length=1024,
         num_workers=2,
         use_streaming=True
     )
     
     # Test one batch
-    print("\n=== Testing batch ===")
-    batch = next(iter(dataloader_stream))
-    print(f"input_ids: {batch['input_ids'].shape}")
-    print(f"labels: {batch['labels'].shape}")
-    print(f"attention_mask: {batch['attention_mask'].shape}")
+    num_batches_to_test = 3
+    for i, batch in enumerate(dataloader_stream):
+        if i >= num_batches_to_test:
+            break # Stop after testing a few batches
+            
+        print(f"\n--- Batch {i+1} ---")
+        print(f"input_ids: {batch['input_ids'].shape}")
+        print(f"labels: {batch['labels'].shape}")
+        print(f"attention_mask: {batch['attention_mask'].shape}")
+        for sequence_ids in batch['input_ids']:
+            decoded_text = tokenizer.decode(sequence_ids)
+            # Print first 150 characters for readability
+            print(f"- {decoded_text[:150]}...")

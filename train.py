@@ -30,7 +30,7 @@ from rich import box
 from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
-from dataset import TextDataset, DataCollator
+from dataset import TextDataset, DataCollator, StreamingIterableDataset
 from optimizer import MuonClip, get_muon_param_groups
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -418,7 +418,7 @@ def main():
     atexit.register(cleanup_handler)
     
     parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
-    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local'])
+    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local','localstreaming'])
     parser.add_argument('--data_path', type=str, default='data/train.txt')
     parser.add_argument('--num_samples', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=2)
@@ -481,6 +481,12 @@ def main():
                 max_length=config.max_seq_length,
                 tokenizer=tokenizer,
                 batch_size=args.batch_size
+            )
+        elif args.dataset == 'localstreaming':
+            dataset = StreamingIterableDataset(
+                file_path= args.data_path,
+                tokenizer=tokenizer,
+                
             )
         else:
             dataset = TextDataset(
