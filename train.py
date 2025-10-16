@@ -410,7 +410,7 @@ def cleanup_handler(signum=None, frame=None):
         torch.cuda.synchronize()
     gc.collect()
     console.print("[green]Cleanup complete[/green]")
-    sys.exit(0)
+
 
 def main():
     signal.signal(signal.SIGINT, cleanup_handler)

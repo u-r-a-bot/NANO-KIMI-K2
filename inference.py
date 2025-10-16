@@ -38,9 +38,9 @@ def generate_text(model, tokenizer, prompt: str, max_new_tokens: int = 100,
     
     input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
     
-    for layer in model.layers:
-        layer.attn.k_cache.zero_()
-        layer.attn.v_cache.zero_()
+    # for layer in model.layers:
+    #     layer.attn.k_cache.zero_()
+    #     layer.attn.v_cache.zero_()
     
     generated_tokens = model.generate(
         input_ids, 

@@ -382,8 +382,8 @@ class Transformer(nn.Module):
     def generate(self, tokens: torch.Tensor, max_new_tokens: int = 100, temperature: float = 0.8, top_p: float = 0.9):
         self.eval()
         for layer in self.layers:
-            layer.attn.k_cache.zero_()
-            layer.attn.v_cache.zero_()
+            layer.attn.k_cache = None
+            layer.attn.v_cache = None
         
         generated_tokens = []
         input_tokens = tokens
