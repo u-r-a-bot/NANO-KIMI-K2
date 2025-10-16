@@ -181,7 +181,8 @@ class MLA(nn.Module):
         start_pos: int,
         input_pos: Optional[torch.Tensor],
         mask: Optional[torch.Tensor],
-        use_cache: bool = False
+        use_cache: bool = False,
+        is_causal: bool = False
     ):
         b, seq_len, _ = x.size()
 
@@ -227,6 +228,7 @@ class MLA(nn.Module):
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=0.0,
+            is_causal=(attn_mask is None and is_causal)
         )
 
         c_v = c_v.transpose(1, 2).contiguous().view(b, seq_len, -1)
@@ -333,8 +335,8 @@ class Block(nn.Module):
         self.attn_norm = nn.RMSNorm(config.dim, eps=1e-5)
         self.ffn_norm = nn.RMSNorm(config.dim, eps=1e-5)
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_pos: torch.Tensor, mask: Optional[torch.Tensor], use_cache: bool = False) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), start_pos, input_pos, mask, use_cache=use_cache)
+    def forward(self, x: torch.Tensor, start_pos: int, input_pos: torch.Tensor, mask: Optional[torch.Tensor], use_cache: bool = False, is_causal: bool = False) -> torch.Tensor:
+        x = x + self.attn(self.attn_norm(x), start_pos, input_pos, mask, use_cache=use_cache, is_causal=is_causal)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -367,12 +369,13 @@ class Transformer(nn.Module):
         
         input_pos = torch.arange(start_pos, start_pos + seqlen, device=tokens.device)
         
+        # Training (multi-token, no cache): use SDPA causal fast-path.
+        # Decoding with cache (usually 1 token): no mask and no is_causal (cache enforces causality).
         mask = None
-        if seqlen > 1:
-            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device,dtype=h.dtype).triu(1)
+        use_is_causal = (seqlen > 1 and not use_cache)
         
         for layer in self.layers:
-            h = layer(h, start_pos, input_pos, mask, use_cache=use_cache)
+            h = layer(h, start_pos, input_pos, mask, use_cache=use_cache, is_causal=use_is_causal)
         
         h = self.norm(h)
         logits = self.head(h)
