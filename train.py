@@ -44,6 +44,7 @@ class Trainer:
         model: torch.nn.Module,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
+        val_samples: Optional[List[Dict[str, torch.Tensor]]] = None,
         learning_rate: float = 0.02,
         momentum: float = 0.95,
         weight_decay: float = 0.01,
@@ -62,6 +63,7 @@ class Trainer:
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.val_samples = val_samples
         self.device = torch.device(device)
         self.model.to(self.device)
         
@@ -150,7 +152,7 @@ class Trainer:
         return True
     
     def evaluate(self):
-        if self.val_loader is None:
+        if self.val_samples is None and self.val_loader is None:
             return None
         
         self.model.eval()
@@ -158,7 +160,8 @@ class Trainer:
         num_batches = 0
         
         with torch.no_grad():
-            for batch in self.val_loader:
+            iterable = self.val_samples if self.val_samples is not None else self.val_loader
+            for batch in iterable:
                 input_ids = batch['input_ids'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
@@ -437,6 +440,8 @@ def main():
     parser.add_argument('--mixed_precision', action='store_true', default=False)
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--checkpoint_path', type=str, default=None)
+    parser.add_argument('--val_from_train', action='store_true', default=False, help='Cache a few training batches on CPU and reuse as validation')
+    parser.add_argument('--val_batches', type=int, default=8, help='Number of training batches to cache for validation')
     
     args = parser.parse_args()
     
@@ -547,10 +552,29 @@ def main():
     console.print(f"[cyan]Trainable parameters: {trainable_params:,}[/cyan]")
     console.print(f"[cyan]Model size: {total_params * 4 / 1024**3:.2f} GB (float32)[/cyan]")
     
+    # Optionally cache a few batches from the same training DataLoader for validation
+    cached_val_samples = None
+    if args.val_from_train and args.eval_interval > 0:
+        console.print(f"[yellow]Caching {args.val_batches} training batches for validation (CPU)...[/yellow]")
+        cached_val_samples = []
+        dl_iter = iter(dataloader)
+        for _ in range(max(0, args.val_batches)):
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                break
+            cached_val_samples.append({
+                'input_ids': batch['input_ids'].cpu(),
+                'labels': batch['labels'].cpu(),
+            })
+        del dl_iter
+        console.print(f"[green]Cached {len(cached_val_samples)} validation batches from training stream[/green]")
+
     trainer = Trainer(
         model=model,
         train_loader=dataloader,
         val_loader=None,
+        val_samples=cached_val_samples,
         learning_rate=args.learning_rate,
         momentum=args.momentum,
         weight_decay=args.weight_decay,
