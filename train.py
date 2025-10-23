@@ -166,7 +166,11 @@ class Trainer:
                 labels = batch['labels'].to(self.device)
                 
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
-                loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+
+                loss = F.cross_entropy(shift_logits.reshape(-1, self.model.vocab_size), shift_labels.reshape(-1))
                 
                 total_loss += loss.item()
                 num_batches += 1
