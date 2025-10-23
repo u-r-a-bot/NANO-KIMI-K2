@@ -14,6 +14,7 @@ class Embeddings(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.table(x)
 
+#Borrowed from Official torch implementation of rotary embeddings
 class RotaryPositionalEmbeddings(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 4096, base: int = 10_000):
         super().__init__()

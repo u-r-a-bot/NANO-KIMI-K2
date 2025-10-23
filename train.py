@@ -167,10 +167,7 @@ class Trainer:
                 
                 logits = self.model(input_ids, start_pos=0, use_cache=False)
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-
-                loss = F.cross_entropy(shift_logits.reshape(-1, self.model.vocab_size), shift_labels.reshape(-1))
+                loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
                 
                 total_loss += loss.item()
                 num_batches += 1
@@ -315,16 +312,13 @@ class Trainer:
                     if self.mixed_precision:
                         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                             logits = self.model(input_ids, start_pos=0, use_cache=False)
-                            shift_logits = logits[..., :-1, :].contiguous()
-                            shift_labels = labels[..., 1:].contiguous()
-                            loss = F.cross_entropy(shift_logits.reshape(-1, self.model.vocab_size), shift_labels.reshape(-1))
+                            loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
+                            
                         loss = loss / self.gradient_accumulation_steps
                         self.scaler.scale(loss).backward()
                     else:
                         logits = self.model(input_ids, start_pos=0, use_cache=False)
-                        shift_logits = logits[..., :-1, :].contiguous()
-                        shift_labels = labels[..., 1:].contiguous()
-                        loss = F.cross_entropy(shift_logits.reshape(-1, self.model.vocab_size), shift_labels.reshape(-1))
+                        loss = F.cross_entropy(logits.reshape(-1, self.model.vocab_size), labels.reshape(-1))
                         loss = loss / self.gradient_accumulation_steps
                         loss.backward()
                     
