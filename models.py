@@ -51,104 +51,8 @@ class RotaryPositionalEmbeddings(nn.Module):
     
 
 
-# class MLA(nn.Module):
-#     def __init__(self, config):
-#         super().__init__()
-#         self.dim = config.dim
-#         self.n_heads = config.n_heads
-#         self.qk_nope_head_dim = config.qk_nope_head_dim
-#         self.qk_rope_head_dim = config.qk_rope_head_dim
-#         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-#         self.v_head_dim = config.v_head_dim
-
-#         # Linear projections
-#         self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
-#         self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
-#         self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
-
-#         # Rotary embeddings for positional encoding
-#         self.rope = RotaryPositionalEmbeddings(
-#             dim=self.qk_rope_head_dim,
-#             max_seq_len=config.max_seq_length
-#         )
-
-#         # Caches for efficient autoregressive inference
-#         self.register_buffer(
-#             "k_cache",
-#             torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.qk_head_dim)
-#         )
-#         self.register_buffer(
-#             "v_cache",
-#             torch.zeros(config.max_batch_size, config.max_seq_length, config.n_heads, self.v_head_dim)
-#         )
-
-#         self.softmax_scale = self.qk_head_dim ** -0.5
-#         self.c_v_linear = nn.Linear(
-#             in_features=self.n_heads * self.v_head_dim,
-#             out_features=self.dim
-#         )
-
-
-#     def forward(
-#         self,
-#         x: torch.Tensor,
-#         start_pos: int,
-#         input_pos: Optional[torch.Tensor],
-#         mask: Optional[torch.Tensor],
-#         use_cache: bool = False
-#     ):
-#         b, seq_len, _ = x.size()
-
-#         # --- Projections ---
-#         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
-#         k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
-#         v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
-
-#         # --- Rotary embeddings ---
-#         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-#         k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-#         q_rope = self.rope(q_rope, input_pos=input_pos)
-#         k_rope = self.rope(k_rope, input_pos=input_pos)
-
-#         q = torch.cat([q_nope, q_rope], dim=-1)
-#         k = torch.cat([k_nope, k_rope], dim=-1)
-
-#         # --- KV caching ---
-#         end_pos = start_pos + seq_len
-#         if use_cache:
-#             self.k_cache[:b, start_pos:end_pos] = k
-#             self.v_cache[:b, start_pos:end_pos] = v
-#             k = self.k_cache[:b, :end_pos]
-#             v = self.v_cache[:b, :end_pos]
-
-#         # --- Flash Attention (SDPA) ---
-#         # PyTorch automatically dispatches to FlashAttention or math kernel depending on device and dtype
-#         # Ensure (B, H, L, D) format for F.scaled_dot_product_attention
-#         q = q.transpose(1, 2)  # (B, H, L, D)
-#         k = k.transpose(1, 2)
-#         v = v.transpose(1, 2)
-        
-
-#         if mask is not None:
-
-#             attn_mask = mask
-#         else:
-#             attn_mask = None
-#         #print(f"q.shape = {q.shape}\n k.shape = {k.shape}\n v.shape={v.shape}\n mask.shape={mask.shape} ")
-#         c_v = F.scaled_dot_product_attention(
-#             q, k, v,
-#             attn_mask=attn_mask,
-#             dropout_p=0.0,
-# #            is_causal=(mask is None)  # if no mask provided, assume causal
-#         )  # -> (B, H, L, D)
-
-#         # --- Project output ---
-#         c_v = c_v.transpose(1, 2).contiguous().view(b, seq_len, -1)
-#         return self.c_v_linear(c_v)
-
 class MLA(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, r=32):   # r = latent dim per head (choose << head_dim)
         super().__init__()
         self.config = config
         self.dim = config.dim
@@ -162,6 +66,13 @@ class MLA(nn.Module):
         self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
         self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
 
+        # compressor layers for MLA ---
+        # r is the latent (compressed) dim per head; make it small (e.g. 16-64)
+        self.r = r
+        self.wq_comp = nn.Linear(self.qk_head_dim, self.r, bias=False)
+        self.wk_comp = nn.Linear(self.qk_head_dim, self.r, bias=False)
+        # ------------------------------------------------
+
         self.rope = RotaryPositionalEmbeddings(
             dim=self.qk_rope_head_dim,
             max_seq_len=config.max_seq_length
@@ -170,7 +81,8 @@ class MLA(nn.Module):
         self.k_cache = None
         self.v_cache = None
 
-        self.softmax_scale = self.qk_head_dim ** -0.5
+        self.softmax_scale = self.r ** -0.5
+
         self.c_v_linear = nn.Linear(
             in_features=self.n_heads * self.v_head_dim,
             out_features=self.dim
@@ -191,6 +103,7 @@ class MLA(nn.Module):
         k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
         v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
 
+        # same RoPE split you had
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -199,6 +112,12 @@ class MLA(nn.Module):
 
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
+
+        # compress q/k into latent r per head ---
+        # q,k shapes: (b, seq_len, n_heads, head_dim)
+        q_comp = self.wq_comp(q)  # -> (b, seq_len, n_heads, r)
+        k_comp = self.wk_comp(k)  # -> (b, seq_len, n_heads, r)
+        # ---------------------------------------------------
 
         end_pos = start_pos + seq_len
         if use_cache:
@@ -213,20 +132,33 @@ class MLA(nn.Module):
                     dtype=x.dtype,
                     device=x.device
                 )
+                # Also cache compressed k if you want to avoid recomputation:
+                self.k_comp_cache = torch.zeros(
+                    (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.r),
+                    dtype=x.dtype,
+                    device=x.device
+                )
 
+            # save full k/v for compatibility; also save k_comp for attention
             self.k_cache[:b, start_pos:end_pos] = k
             self.v_cache[:b, start_pos:end_pos] = v
-            k = self.k_cache[:b, :end_pos]
-            v = self.v_cache[:b, :end_pos]
+            self.k_comp_cache[:b, start_pos:end_pos] = k_comp
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
+            k_comp_for_attn = self.k_comp_cache[:b, :end_pos]  # compressed k for attn
+            v = self.v_cache[:b, :end_pos]
+        else:
+            k_comp_for_attn = k_comp
+
+        # transpose for attention: (b, n_heads, seq_len, r)
+        q_comp = q_comp.transpose(1, 2)
+        k_comp_for_attn = k_comp_for_attn.transpose(1, 2)
         v = v.transpose(1, 2)
 
         attn_mask = mask if mask is not None else None
 
+        # scaled_dot_product_attention accepts different head dims for q/k (r) and v (v_head_dim)
         c_v = F.scaled_dot_product_attention(
-            q, k, v,
+            q_comp, k_comp_for_attn, v,
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=(attn_mask is None and is_causal)
@@ -234,6 +166,95 @@ class MLA(nn.Module):
 
         c_v = c_v.transpose(1, 2).contiguous().view(b, seq_len, -1)
         return self.c_v_linear(c_v)
+
+
+# class MLA(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+#         self.dim = config.dim
+#         self.n_heads = config.n_heads
+#         self.qk_nope_head_dim = config.qk_nope_head_dim
+#         self.qk_rope_head_dim = config.qk_rope_head_dim
+#         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+#         self.v_head_dim = config.v_head_dim
+#
+#         self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
+#         self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
+#         self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
+#
+#         self.rope = RotaryPositionalEmbeddings(
+#             dim=self.qk_rope_head_dim,
+#             max_seq_len=config.max_seq_length
+#         )
+#
+#         self.k_cache = None
+#         self.v_cache = None
+#
+#         self.softmax_scale = self.qk_head_dim ** -0.5
+#         self.c_v_linear = nn.Linear(
+#             in_features=self.n_heads * self.v_head_dim,
+#             out_features=self.dim
+#         )
+#
+#     def forward(
+#         self,
+#         x: torch.Tensor,
+#         start_pos: int,
+#         input_pos: Optional[torch.Tensor],
+#         mask: Optional[torch.Tensor],
+#         use_cache: bool = False,
+#         is_causal: bool = False
+#     ):
+#         b, seq_len, _ = x.size()
+#
+#         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
+#         k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
+#         v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
+#
+#         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+#         k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+#
+#         q_rope = self.rope(q_rope, input_pos=input_pos)
+#         k_rope = self.rope(k_rope, input_pos=input_pos)
+#
+#         q = torch.cat([q_nope, q_rope], dim=-1)
+#         k = torch.cat([k_nope, k_rope], dim=-1)
+#
+#         end_pos = start_pos + seq_len
+#         if use_cache:
+#             if self.k_cache is None:
+#                 self.k_cache = torch.zeros(
+#                     (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.qk_head_dim),
+#                     dtype=x.dtype,
+#                     device=x.device
+#                 )
+#                 self.v_cache = torch.zeros(
+#                     (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.v_head_dim),
+#                     dtype=x.dtype,
+#                     device=x.device
+#                 )
+#
+#             self.k_cache[:b, start_pos:end_pos] = k
+#             self.v_cache[:b, start_pos:end_pos] = v
+#             k = self.k_cache[:b, :end_pos]
+#             v = self.v_cache[:b, :end_pos]
+#
+#         q = q.transpose(1, 2)
+#         k = k.transpose(1, 2)
+#         v = v.transpose(1, 2)
+#
+#         attn_mask = mask if mask is not None else None
+#
+#         c_v = F.scaled_dot_product_attention(
+#             q, k, v,
+#             attn_mask=attn_mask,
+#             dropout_p=0.0,
+#             is_causal=(attn_mask is None and is_causal)
+#         )
+#
+#         c_v = c_v.transpose(1, 2).contiguous().view(b, seq_len, -1)
+#         return self.c_v_linear(c_v)
 
 
 class MLP(nn.Module):
