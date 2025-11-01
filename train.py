@@ -131,26 +131,32 @@ class Trainer:
             'scaler_state_dict': self.scaler.state_dict() if self.scaler is not None else None
         }, checkpoint_path)
         console.print(f"[green]Checkpoint saved: {checkpoint_path}[/green]")
-    
+
     def load_checkpoint(self, checkpoint_path: str) -> bool:
         if checkpoint_path is None or not Path(checkpoint_path).exists():
             return False
-        
+
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'],strict= False)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            console.print(f"[green] Optimizer checkpoint Loaded[/green]")
+        except ValueError as e:
+            console.print(f"[yellow]{e}[/yellow]")
+            console.print(f"[yellow] Optimizer checkpoint load failed starting new[/yellow]")
+
         self.global_step = checkpoint['global_step']
         self.epoch = checkpoint['epoch']
         self.best_loss = checkpoint.get('best_loss', float('inf'))
         self.metrics = checkpoint.get('metrics', self.metrics)
-        
+
         if self.scaler is not None and checkpoint.get('scaler_state_dict') is not None:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
+
         console.print(f"[green]Checkpoint loaded: {checkpoint_path}[/green]")
         console.print(f"[cyan]Resuming from step {self.global_step}, epoch {self.epoch}[/cyan]")
         return True
-    
+
     def evaluate(self):
         if self.val_samples is None and self.val_loader is None:
             return None
