@@ -269,7 +269,7 @@ class DirectStreamingDataset(IterableDataset):
     
     def _detect_text_column(self) -> Optional[str]:
         """Auto-detect the text column name"""
-        common_text_columns = ['text', 'content', 'prompt', 'output', 'passage', 'document', 'article']
+        common_text_columns = ['text', 'content',  'document', 'article']
         
         try:
             first_example = next(iter(self.dataset.take(1)))
