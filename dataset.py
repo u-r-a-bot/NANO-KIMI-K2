@@ -420,8 +420,7 @@ class DataCollator:
 
 
 class FileStreamingIterableDataset(IterableDataset):
-    """Streaming dataset for local text files"""
-    
+    """Streaming dataset for local text files — worker-aware and robust tokenization"""
     def __init__(
         self,
         file_path: Union[str, Path],
@@ -430,76 +429,91 @@ class FileStreamingIterableDataset(IterableDataset):
         buffer_size: int = 10000,
         shuffle_buffer: int = 1000,
         stride: Optional[int] = None,
+        seed: int = 42,
     ):
         self.file_path = Path(file_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.buffer_size = buffer_size
         self.shuffle_buffer = shuffle_buffer
-        self.stride = stride if stride is not None else max_length // 2
-        
+        self.stride = stride if stride is not None else max_length
+        self.seed = seed
+
         if not self.file_path.exists():
             raise FileNotFoundError(f"File not found: {self.file_path}")
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            worker_seed = self.seed + worker_id
+            random.seed(worker_seed)
+        else:
+            worker_id = 0
+            num_workers = 1
+            random.seed(self.seed)
+
         shuffle_buf = []
-        
+        token_buffer = []
+
+        file_size = os.path.getsize(self.file_path)
+        # partition file by bytes per worker
+        bytes_per_worker = file_size // num_workers
+        start_byte = worker_id * bytes_per_worker
+        end_byte = start_byte + bytes_per_worker if worker_id != num_workers - 1 else file_size
+
         with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            token_buffer = []
-            line_idx = 0
-            
-            for line in f:
-                if not line.strip():
-                    continue
-                
-                # Worker sharding
-                if worker_info is not None:
-                    if (line_idx % worker_info.num_workers) != worker_info.id:
-                        line_idx += 1
-                        continue
-                
-                # Tokenize line
+            # seek to start_byte; if not zero, skip partial token
+            f.seek(start_byte)
+            if start_byte != 0:
+                # discard partial chunk to next newline to avoid broken utf-8 fragments
+                f.readline()
+
+            read_pos = f.tell()
+            CHUNK_CHARS = max(32 * 1024, self.buffer_size * 10)  # read ~32KB chunks unless buffer says more
+            while read_pos < end_byte:
+                to_read = min(CHUNK_CHARS, end_byte - read_pos)
+                text_chunk = f.read(to_read)
+                if not text_chunk:
+                    break
+                read_pos = f.tell()
+
                 try:
-                    tokens = self.tokenizer.encode(line.strip(), add_special_tokens=False)
-                    token_buffer.extend(tokens)
+                    tokens = self.tokenizer(text_chunk, add_special_tokens=False)['input_ids']
                 except Exception:
-                    line_idx += 1
                     continue
-                
-                # Create samples from buffer
+
+                token_buffer.extend(tokens)
+
+                # Create samples
                 while len(token_buffer) >= self.max_length:
-                    chunk = token_buffer[:self.max_length]
+                    window = token_buffer[:self.max_length]
+                    # advance by stride
                     token_buffer = token_buffer[self.stride:]
-                    
-                    if len(chunk) > 1:
+                    if len(window) > 1:
                         sample = {
-                            'input_ids': torch.tensor(chunk[:-1], dtype=torch.long),
-                            'labels': torch.tensor(chunk[1:], dtype=torch.long),
+                            'input_ids': torch.tensor(window[:-1], dtype=torch.long),
+                            'labels': torch.tensor(window[1:], dtype=torch.long),
                         }
                         shuffle_buf.append(sample)
-                        
-                        # Yield shuffled samples
+
                         if len(shuffle_buf) >= self.shuffle_buffer:
                             random.shuffle(shuffle_buf)
                             yield from shuffle_buf
                             shuffle_buf = []
-                
-                # Prevent buffer from growing too large
-                if len(token_buffer) > 2 * self.max_length:
-                    token_buffer = token_buffer[-self.max_length:]
-                
-                line_idx += 1
-            
-            # Process remaining tokens
-            if len(token_buffer) > 1:
-                sample = {
-                    'input_ids': torch.tensor(token_buffer[:-1], dtype=torch.long),
-                    'labels': torch.tensor(token_buffer[1:], dtype=torch.long),
-                }
-                shuffle_buf.append(sample)
-            
-            # Yield remaining samples
+
+            # flush remaining windows
+            while len(token_buffer) >= self.max_length:
+                window = token_buffer[:self.max_length]
+                token_buffer = token_buffer[self.stride:]
+                if len(window) > 1:
+                    sample = {
+                        'input_ids': torch.tensor(window[:-1], dtype=torch.long),
+                        'labels': torch.tensor(window[1:], dtype=torch.long),
+                    }
+                    shuffle_buf.append(sample)
+
             if shuffle_buf:
                 random.shuffle(shuffle_buf)
                 yield from shuffle_buf
