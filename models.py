@@ -48,11 +48,10 @@ class RotaryPositionalEmbeddings(nn.Module):
         )
         x_out = x_out.flatten(3)
         return x_out.type_as(x)
-    
 
 
 class MLA(nn.Module):
-    def __init__(self, config, r=32):   # r = latent dim per head (choose << head_dim)
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.dim = config.dim
@@ -61,104 +60,108 @@ class MLA(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
 
+        # Q stays per-head
         self.wq = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
-        self.wk = nn.Linear(self.dim, self.n_heads * self.qk_head_dim, bias=False)
-        self.wv = nn.Linear(self.dim, self.n_heads * self.v_head_dim, bias=False)
 
-        # compressor layers for MLA ---
-        # r is the latent (compressed) dim per head; make it small (e.g. 16-64)
-        self.r = r
-        self.wq_comp = nn.Linear(self.qk_head_dim, self.r, bias=False)
-        self.wk_comp = nn.Linear(self.qk_head_dim, self.r, bias=False)
-        # ------------------------------------------------
+        # K/V use compressed latent space (THIS IS THE KEY CHANGE!)
+        self.wk_compress = nn.Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
+        self.wv_compress = nn.Linear(self.dim, self.kv_lora_rank, bias=False)
+
+        # Up-project compressed K/V to per-head space
+        self.wk_up = nn.Linear(self.kv_lora_rank, self.n_heads * self.qk_nope_head_dim, bias=False)
+        self.wv_up = nn.Linear(self.kv_lora_rank, self.n_heads * self.v_head_dim, bias=False)
 
         self.rope = RotaryPositionalEmbeddings(
             dim=self.qk_rope_head_dim,
             max_seq_len=config.max_seq_length
         )
 
+        # Cache now stores COMPRESSED representations!
         self.k_cache = None
         self.v_cache = None
 
-        self.softmax_scale = self.r ** -0.5
-
+        self.softmax_scale = self.qk_head_dim ** -0.5
         self.c_v_linear = nn.Linear(
             in_features=self.n_heads * self.v_head_dim,
             out_features=self.dim
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        input_pos: Optional[torch.Tensor],
-        mask: Optional[torch.Tensor],
-        use_cache: bool = False,
-        is_causal: bool = False
+            self,
+            x: torch.Tensor,
+            start_pos: int,
+            input_pos: Optional[torch.Tensor],
+            mask: Optional[torch.Tensor],
+            use_cache: bool = False,
+            is_causal: bool = False
     ):
         b, seq_len, _ = x.size()
 
+        # Q: standard per-head projection
         q = self.wq(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
-        k = self.wk(x).view(b, seq_len, self.n_heads, self.qk_head_dim)
-        v = self.wv(x).view(b, seq_len, self.n_heads, self.v_head_dim)
-
-        # same RoPE split you had
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_nope, k_rope = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+        # K: compress then expand (MLA magic!)
+        k_compress = self.wk_compress(x)  # [b, seq_len, kv_lora_rank + qk_rope_head_dim]
+        k_compress_nope, k_rope = torch.split(k_compress, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+
+        # V: compress then expand
+        v_compress = self.wv_compress(x)  # [b, seq_len, kv_lora_rank]
+
+        # Apply RoPE to q and k rope components
         q_rope = self.rope(q_rope, input_pos=input_pos)
-        k_rope = self.rope(k_rope, input_pos=input_pos)
+        k_rope = self.rope(k_rope.unsqueeze(2), input_pos=input_pos)  # Add head dim for rope
 
-        q = torch.cat([q_nope, q_rope], dim=-1)
-        k = torch.cat([k_nope, k_rope], dim=-1)
-
-        # compress q/k into latent r per head ---
-        # q,k shapes: (b, seq_len, n_heads, head_dim)
-        q_comp = self.wq_comp(q)  # -> (b, seq_len, n_heads, r)
-        k_comp = self.wk_comp(k)  # -> (b, seq_len, n_heads, r)
-        # ---------------------------------------------------
-
+        # Cache management: store COMPRESSED k/v
         end_pos = start_pos + seq_len
         if use_cache:
             if self.k_cache is None:
                 self.k_cache = torch.zeros(
-                    (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.qk_head_dim),
+                    (self.config.max_batch_size, self.config.max_seq_length, self.kv_lora_rank),
                     dtype=x.dtype,
                     device=x.device
                 )
                 self.v_cache = torch.zeros(
-                    (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.v_head_dim),
+                    (self.config.max_batch_size, self.config.max_seq_length, self.kv_lora_rank),
                     dtype=x.dtype,
                     device=x.device
                 )
-                # Also cache compressed k if you want to avoid recomputation:
-                self.k_comp_cache = torch.zeros(
-                    (self.config.max_batch_size, self.config.max_seq_length, self.n_heads, self.r),
+                self.k_rope_cache = torch.zeros(
+                    (self.config.max_batch_size, self.config.max_seq_length, 1, self.qk_rope_head_dim),
                     dtype=x.dtype,
                     device=x.device
                 )
 
-            # save full k/v for compatibility; also save k_comp for attention
-            self.k_cache[:b, start_pos:end_pos] = k
-            self.v_cache[:b, start_pos:end_pos] = v
-            self.k_comp_cache[:b, start_pos:end_pos] = k_comp
+            self.k_cache[:b, start_pos:end_pos] = k_compress_nope
+            self.v_cache[:b, start_pos:end_pos] = v_compress
+            self.k_rope_cache[:b, start_pos:end_pos] = k_rope
 
-            k_comp_for_attn = self.k_comp_cache[:b, :end_pos]  # compressed k for attn
-            v = self.v_cache[:b, :end_pos]
-        else:
-            k_comp_for_attn = k_comp
+            k_compress_nope = self.k_cache[:b, :end_pos]
+            v_compress = self.v_cache[:b, :end_pos]
+            k_rope = self.k_rope_cache[:b, :end_pos]
 
-        # transpose for attention: (b, n_heads, seq_len, r)
-        q_comp = q_comp.transpose(1, 2)
-        k_comp_for_attn = k_comp_for_attn.transpose(1, 2)
+        # Up-project compressed K/V to per-head space
+        k_nope = self.wk_up(k_compress_nope).view(b, -1, self.n_heads, self.qk_nope_head_dim)
+        v = self.wv_up(v_compress).view(b, -1, self.n_heads, self.v_head_dim)
+
+        # Expand k_rope to all heads
+        k_rope = k_rope.expand(b, -1, self.n_heads, self.qk_rope_head_dim)
+
+        # Concatenate q and k components
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        # Standard attention
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         attn_mask = mask if mask is not None else None
 
-        # scaled_dot_product_attention accepts different head dims for q/k (r) and v (v_head_dim)
         c_v = F.scaled_dot_product_attention(
-            q_comp, k_comp_for_attn, v,
+            q, k, v,
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=(attn_mask is None and is_causal)

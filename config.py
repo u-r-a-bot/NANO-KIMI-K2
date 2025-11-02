@@ -59,7 +59,7 @@ class Config:
     qk_nope_head_dim: int = 56
     qk_rope_head_dim: int = 56
     v_head_dim: int = 112
-    
+    kv_lora_rank: int = 256
     max_batch_size: int = 16
     
     n_routed_experts: int = 8
