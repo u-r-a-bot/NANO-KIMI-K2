@@ -316,6 +316,8 @@ class DirectStreamingDataset(IterableDataset):
             # Tokenize
             try:
                 text_tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                if self.tokenizer.eos_token_id is not None:
+                    text_tokens.append(self.tokenizer.eos_token_id)
             except Exception:
                 continue
                 
@@ -481,6 +483,8 @@ class FileStreamingIterableDataset(IterableDataset):
 
                 try:
                     tokens = self.tokenizer(text_chunk, add_special_tokens=False)['input_ids']
+                    if self.tokenizer.eos_token_id is not None:
+                        tokens.append(self.tokenizer.eos_token_id)
                 except Exception:
                     continue
 
