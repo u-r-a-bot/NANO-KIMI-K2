@@ -247,6 +247,7 @@ class DirectStreamingDataset(IterableDataset):
             'en',
             '4plus',  # finemath-4plus (highest quality)
             '3plus',
+            'auto_math_text' # hugginfaceTB Cosmopedia ->math
         ]
         
         # Try to find a config matching priority patterns
