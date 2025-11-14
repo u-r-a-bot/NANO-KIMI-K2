@@ -198,7 +198,7 @@ class DirectStreamingDataset(IterableDataset):
         # Auto-detect config if needed
         if dataset_config_name is None and auto_detect_config:
             try:
-                available_configs = get_dataset_config_names(dataset_name, trust_remote_code=trust_remote_code)
+                available_configs = get_dataset_config_names(dataset_name)
                 if available_configs:
                     # Use first config or a smart default
                     self.dataset_config_name = self._select_best_config(available_configs)
