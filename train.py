@@ -601,7 +601,7 @@ def main():
             console.print("[yellow]No checkpoint found, starting from scratch[/yellow]")
     # Adding Torch Compile for optimizations
     if trainer.device.type == "cuda":
-    major, minor = torch.cuda.get_device_capability()
+        major, minor = torch.cuda.get_device_capability()
     if major >= 7:  # Volta (7.0), Ampere (8.x), Ada etc
         try:
             trainer.model = torch.compile(trainer.model)
