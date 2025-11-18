@@ -599,7 +599,12 @@ def main():
         loaded = trainer.load_checkpoint(args.checkpoint_path)
         if not loaded:
             console.print("[yellow]No checkpoint found, starting from scratch[/yellow]")
-    
+    # Adding Torch Compile for optimizations
+    try:
+        trainer.model = torch.compile(trainer.model)
+        console.print("[green]Model Compiled with torch compile[/green]")
+    except:
+        console.print(f"[yellow]torch.compile failed, continuing without compile: {e}[/yellow]")
     training_success = False
     exception_occurred = False
     
