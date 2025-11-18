@@ -600,12 +600,16 @@ def main():
         if not loaded:
             console.print("[yellow]No checkpoint found, starting from scratch[/yellow]")
     # Adding Torch Compile for optimizations
-    try:
-        trainer.model = torch.compile(trainer.model)
-        console.print("[green]Model Compiled with torch compile[/green]")
-    except:
-        console.print(f"[yellow]torch.compile failed, continuing without compile: {e}[/yellow]")
-    training_success = False
+    if trainer.device.type == "cuda":
+    major, minor = torch.cuda.get_device_capability()
+    if major >= 7:  # Volta (7.0), Ampere (8.x), Ada etc
+        try:
+            trainer.model = torch.compile(trainer.model)
+            console.print("[green]Model compiled with torch.compile()[/green]")
+        except Exception as e:
+            console.print(f"[yellow]torch.compile failed, continuing without compile: {e}[/yellow]")
+    else:
+        console.print(f"[yellow]torch.compile skipped: GPU compute capability {major}.{minor} too old[/yellow]")
     exception_occurred = False
     
     try:
