@@ -58,8 +58,27 @@ def load_model(checkpoint_path: str, device: str = None):
         model = Transformer(config).to(device).to(dtype)
         
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+        state_dict = checkpoint["model_state_dict"]
+
+        is_compiled = any(k.startswith("_orig_mod.") for k in state_dict)
+
+        if is_compiled:
+            console.print("[yellow]Detected torch.compile-style checkpoint — fixing keys...[/yellow]")
+            clean_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("_orig_mod."):
+                    new_key = k.replace("_orig_mod.", "", 1)
+                else:
+                    new_key = k
+                clean_state_dict[new_key] = v
+            state_dict = clean_state_dict
+        else:
+            console.print("[green]Checkpoint is already clean — no fix needed[/green]")
+
+        model.load_state_dict(state_dict, strict=True)
         model.eval()
+
         
         progress.update(task, description="Model loaded successfully!")
         time.sleep(0.5)  # Brief pause for visual effect
