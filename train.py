@@ -135,26 +135,43 @@ class Trainer:
     def load_checkpoint(self, checkpoint_path: str) -> bool:
         if checkpoint_path is None or not Path(checkpoint_path).exists():
             return False
-
+    
+        console.print(f"[cyan]Loading checkpoint from {checkpoint_path}[/cyan]")
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint['model_state_dict'],strict= False)
+    
+        state_dict = checkpoint["model_state_dict"]
+        is_compiled = any(k.startswith("_orig_mod.") for k in state_dict)
+    
+        if is_compiled:
+            console.print("[yellow]Fixing torch.compile checkpoint keys...[/yellow]")
+            clean_state_dict = {}
+            for k, v in state_dict.items():
+                new_key = k.replace("_orig_mod.", "", 1) if k.startswith("_orig_mod.") else k
+                clean_state_dict[new_key] = v
+            state_dict = clean_state_dict
+        else:
+            console.print("[green]Checkpoint keys clean[/green]")
+    
+        self.model.load_state_dict(state_dict, strict=False)
+    
         try:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            console.print(f"[green] Optimizer checkpoint Loaded[/green]")
-        except ValueError as e:
-            console.print(f"[yellow]{e}[/yellow]")
-            console.print(f"[yellow] Optimizer checkpoint load failed starting new[/yellow]")
-
-        self.global_step = checkpoint['global_step']
-        self.epoch = checkpoint['epoch']
-        self.best_loss = checkpoint.get('best_loss', float('inf'))
-        self.metrics = checkpoint.get('metrics', self.metrics)
-
-        if self.scaler is not None and checkpoint.get('scaler_state_dict') is not None:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-        console.print(f"[green]Checkpoint loaded: {checkpoint_path}[/green]")
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            console.print("[green]Optimizer state loaded[/green]")
+        except Exception as e:
+            console.print(f"[yellow]Optimizer load failed: {e}[/yellow]")
+    
+        self.global_step = checkpoint.get("global_step", 0)
+        self.epoch = checkpoint.get("epoch", 0)
+        self.best_loss = checkpoint.get("best_loss", float("inf"))
+        self.metrics = checkpoint.get("metrics", self.metrics)
+    
+        if self.scaler is not None and checkpoint.get("scaler_state_dict") is not None:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            console.print("[green]AMP scaler loaded[/green]")
+    
+        console.print(f"[green]Checkpoint loaded[/green]")
         console.print(f"[cyan]Resuming from step {self.global_step}, epoch {self.epoch}[/cyan]")
+    
         return True
 
     def evaluate(self):
