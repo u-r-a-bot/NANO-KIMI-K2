@@ -423,22 +423,21 @@ class DataCollator:
 
 
 class FileStreamingIterableDataset(IterableDataset):
-    """Streaming dataset for local text files — worker-aware and robust tokenization"""
     def __init__(
-        self,
-        file_path: Union[str, Path],
-        tokenizer,
-        max_length: int = 1024,
-        buffer_size: int = 10000,
-        shuffle_buffer: int = 1000,
-        stride: Optional[int] = None,
-        seed: int = 42,
+            self,
+            file_path: Union[str, Path],
+            tokenizer,
+            max_length: int = 1024,
+            buffer_size: int = 10000,
+            stride: Optional[int] = None,
+            seed: int = 42,
     ):
         self.file_path = Path(file_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # We need 1 extra token for next-token prediction (input + target)
+        self.req_len = max_length + 1
         self.buffer_size = buffer_size
-        self.shuffle_buffer = shuffle_buffer
         self.stride = stride if stride is not None else max_length
         self.seed = seed
 
@@ -446,44 +445,51 @@ class FileStreamingIterableDataset(IterableDataset):
             raise FileNotFoundError(f"File not found: {self.file_path}")
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
+        worker_info =torch.utils.data.get_worker_info()
         if worker_info is not None:
             worker_id = worker_info.id
             num_workers = worker_info.num_workers
             worker_seed = self.seed + worker_id
-            random.seed(worker_seed)
         else:
             worker_id = 0
             num_workers = 1
-            random.seed(self.seed)
+            worker_seed = self.seed
+
+        random.seed(worker_seed)
 
         shuffle_buf = []
         token_buffer = []
 
         file_size = os.path.getsize(self.file_path)
-        # partition file by bytes per worker
         bytes_per_worker = file_size // num_workers
         start_byte = worker_id * bytes_per_worker
         end_byte = start_byte + bytes_per_worker if worker_id != num_workers - 1 else file_size
 
         with open(self.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            # seek to start_byte; if not zero, skip partial token
             f.seek(start_byte)
+
+            # If not the first worker, skip the first partial line (it belongs to prev worker)
             if start_byte != 0:
-                # discard partial chunk to next newline to avoid broken utf-8 fragments
                 f.readline()
 
-            read_pos = f.tell()
-            CHUNK_CHARS = max(32 * 1024, self.buffer_size * 10)  # read ~32KB chunks unless buffer says more
-            while read_pos < end_byte:
-                to_read = min(CHUNK_CHARS, end_byte - read_pos)
-                text_chunk = f.read(to_read)
-                if not text_chunk:
+            while True:
+                # FIX: Read strictly until we pass our chunk,
+                # UNLESS we are the last worker who must read to EOF.
+                # Ideally, we read until the line *finishes* even if it crosses end_byte.
+                current_pos = f.tell()
+
+                if worker_id != num_workers - 1 and current_pos >= end_byte:
                     break
-                read_pos = f.tell()
+
+                line = f.readline()
+                if not line:
+                    break
+
+                if not line.strip():
+                    continue
 
                 try:
-                    tokens = self.tokenizer(text_chunk, add_special_tokens=False)['input_ids']
+                    tokens = self.tokenizer.encode(line, add_special_tokens=False)
                     if self.tokenizer.eos_token_id is not None:
                         tokens.append(self.tokenizer.eos_token_id)
                 except Exception:
@@ -491,37 +497,28 @@ class FileStreamingIterableDataset(IterableDataset):
 
                 token_buffer.extend(tokens)
 
-                # Create samples
-                while len(token_buffer) >= self.max_length:
-                    window = token_buffer[:self.max_length]
-                    # advance by stride
+                # FIX: Check against req_len (max_length + 1)
+                while len(token_buffer) >= self.req_len:
+                    window = token_buffer[:self.req_len]
                     token_buffer = token_buffer[self.stride:]
-                    if len(window) > 1:
+
+                    # Create exactly max_length inputs
+                    if len(window) == self.req_len:
                         sample = {
                             'input_ids': torch.tensor(window[:-1], dtype=torch.long),
                             'labels': torch.tensor(window[1:], dtype=torch.long),
                         }
-                        shuffle_buf.append(sample)
 
-                        if len(shuffle_buf) >= self.shuffle_buffer:
-                            random.shuffle(shuffle_buf)
-                            yield from shuffle_buf
-                            shuffle_buf = []
+                        if len(shuffle_buf) < self.buffer_size:
+                            shuffle_buf.append(sample)
+                        else:
+                            idx = random.randint(0, len(shuffle_buf) - 1)
+                            yield shuffle_buf[idx]
+                            shuffle_buf[idx] = sample
 
-            # flush remaining windows
-            while len(token_buffer) >= self.max_length:
-                window = token_buffer[:self.max_length]
-                token_buffer = token_buffer[self.stride:]
-                if len(window) > 1:
-                    sample = {
-                        'input_ids': torch.tensor(window[:-1], dtype=torch.long),
-                        'labels': torch.tensor(window[1:], dtype=torch.long),
-                    }
-                    shuffle_buf.append(sample)
-
-            if shuffle_buf:
-                random.shuffle(shuffle_buf)
-                yield from shuffle_buf
+        # Flush remaining buffer
+        random.shuffle(shuffle_buf)
+        yield from shuffle_buf
 
 
 class PreloadedDataset(Dataset):
