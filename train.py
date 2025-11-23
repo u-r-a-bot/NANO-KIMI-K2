@@ -524,8 +524,8 @@ def main():
             dataset = FileStreamingIterableDataset(
                 file_path= args.data_path,
                 tokenizer=tokenizer,
-                max_length=512,
-                stride=256,
+                max_length = config.max_seq_length,
+                stride=None,
                 shuffle_buffer_size=1000,
                 hf_shuffle=True,
                 seed=42  
