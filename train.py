@@ -30,7 +30,7 @@ from rich import box
 from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
-from dataset import TextDataset, DataCollator, FileStreamingIterableDataset,DirectStreamingDataset
+from dataset import TextDataset, DataCollator, FileStreamingIterableDataset,DirectStreamingDataset,ParquetDataset
 from optimizer import MuonClip, get_muon_param_groups
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -529,6 +529,16 @@ def main():
                 shuffle_buffer_size=1000,
                 hf_shuffle=True,
                 seed=42  
+            )
+        elif args.dataset == 'parquet':
+            if args.hf_repo_name == None:
+                raise ValueError("Dataset name not provided use \'--hf_repo_name\' argument")
+            dataset = ParquetDataset(
+                file_path=args.data_path,
+                tokenizer=tokenizer,
+                max_length=config.max_seq_length,
+                stride=256,
+                num_proc=4
             )
         else:
             dataset = TextDataset(

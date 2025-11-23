@@ -520,6 +520,97 @@ class FileStreamingIterableDataset(IterableDataset):
         random.shuffle(shuffle_buf)
         yield from shuffle_buf
 
+class ParquetDataset(Dataset):
+    def __init__(
+        self,
+        file_path: Union[str, Path],
+        tokenizer,
+        max_length: int = 1024,
+        stride: int = 512,
+        num_proc: int = 4
+    ):
+        try:
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+            self.stride = stride
+
+            if tokenizer is None:
+                raise ValueError("Tokenizer cannot be None")
+
+            file_path = Path(file_path)
+
+            if not file_path.exists():
+                raise FileNotFoundError(f"Path does not exist: {file_path}")
+
+            parquet_files = list(file_path.glob("*.parquet"))
+            if len(parquet_files) == 0:
+                raise FileNotFoundError(f"No .parquet files found in: {file_path}")
+
+            try:
+                ds = load_dataset(
+                    "parquet",
+                    data_files=str(file_path / "*.parquet"),
+                    split="train"
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to load Parquet files: {e}")
+
+            if "text" not in ds.column_names:
+                raise KeyError(f"'text' column not found in dataset. Columns: {ds.column_names}")
+
+            try:
+                tokenized = ds.map(
+                    lambda x: self.tokenizer(x["text"], add_special_tokens=False),
+                    batched=True,
+                    num_proc=num_proc,
+                    remove_columns=ds.column_names
+                )
+            except Exception as e:
+                raise RuntimeError(f"Tokenization failed: {e}")
+
+            samples = []
+            for tokens in tokenized["input_ids"]:
+                if not isinstance(tokens, list):
+                    continue
+
+                L = len(tokens)
+                if L < 2:
+                    continue
+
+                i = 0
+                while i + 1 < L:
+                    end = min(i + max_length + 1, L)
+                    chunk = tokens[i:end]
+
+                    if len(chunk) > 1:
+                        samples.append(chunk)
+
+                    if end == L:
+                        break
+
+                    i += stride
+
+            if len(samples) == 0:
+                raise RuntimeError("No valid samples were generated from the Parquet dataset.")
+
+            self.samples = samples
+
+        except Exception as e:
+            raise RuntimeError(f"ParquetDataset initialization failed: {e}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        try:
+            chunk = self.samples[idx]
+            chunk = torch.tensor(chunk, dtype=torch.long)
+            return {
+                "input_ids": chunk[:-1],
+                "labels": chunk[1:]
+            }
+        except Exception as e:
+            raise RuntimeError(f"Failed to load sample {idx}: {e}")
 
 class PreloadedDataset(Dataset):
     """Pre-load entire dataset in RAM for maximum speed (small datasets only)"""
