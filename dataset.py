@@ -553,11 +553,10 @@ class TokenBinDataset(Dataset):
             start = idx * self.stride
 
         chunk = self.data[start : start + self.max_length + 1]
-
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-
-        return x, y
+        return{
+        'input_ids':torch.tensor(chunk[:-1], dtype=torch.long),
+        'labels' :torch.tensor(chunk[1:], dtype=torch.long)
+        }
 
 
 class PreloadedDataset(Dataset):
