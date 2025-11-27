@@ -520,97 +520,45 @@ class FileStreamingIterableDataset(IterableDataset):
         random.shuffle(shuffle_buf)
         yield from shuffle_buf
 
-class ParquetDataset(Dataset):
-    def __init__(
-        self,
-        file_path: Union[str, Path],
-        tokenizer,
-        max_length: int = 1024,
-        stride: int = 512,
-        num_proc: int = 4
-    ):
-        try:
-            self.tokenizer = tokenizer
-            self.max_length = max_length
-            self.stride = stride
+class TokenBinDataset(Dataset):
+    def __init__(self, bin_path, max_length=1024, stride=None, random_offset=True, dtype=np.uint16):
+        """
+        bin_path: path to train.bin created with uint16 tokens
+        max_length: sequence length
+        stride: how much to shift between sequences.
+                None = equal to max_length (no overlap)
+        random_offset: if True, adds randomness so DataLoader workers see different chunks
+        """
+        self.data = np.memmap(bin_path, dtype=dtype, mode="r")
+        self.max_length = max_length
+        self.random_offset = random_offset
+        self.stride = stride if stride is not None else max_length
 
-            if tokenizer is None:
-                raise ValueError("Tokenizer cannot be None")
+        # number of possible chunks
+        self.num_chunks = (len(self.data) - max_length) // self.stride
 
-            file_path = Path(file_path)
-
-            if not file_path.exists():
-                raise FileNotFoundError(f"Path does not exist: {file_path}")
-
-            parquet_files = list(file_path.glob("*.parquet"))
-            if len(parquet_files) == 0:
-                raise FileNotFoundError(f"No .parquet files found in: {file_path}")
-
-            try:
-                ds = load_dataset(
-                    "parquet",
-                    data_files=str(file_path / "*.parquet"),
-                    split="train"
-                )
-            except Exception as e:
-                raise RuntimeError(f"Failed to load Parquet files: {e}")
-
-            if "text" not in ds.column_names:
-                raise KeyError(f"'text' column not found in dataset. Columns: {ds.column_names}")
-
-            try:
-                tokenized = ds.map(
-                    lambda x: self.tokenizer(x["text"], add_special_tokens=False),
-                    batched=True,
-                    num_proc=num_proc,
-                    remove_columns=ds.column_names
-                )
-            except Exception as e:
-                raise RuntimeError(f"Tokenization failed: {e}")
-
-            samples = []
-            for tokens in tokenized["input_ids"]:
-                if not isinstance(tokens, list):
-                    continue
-
-                L = len(tokens)
-                if L < 2:
-                    continue
-
-                i = 0
-                while i + 1 < L:
-                    end = min(i + max_length + 1, L)
-                    chunk = tokens[i:end]
-
-                    if len(chunk) > 1:
-                        samples.append(chunk)
-
-                    if end == L:
-                        break
-
-                    i += stride
-
-            if len(samples) == 0:
-                raise RuntimeError("No valid samples were generated from the Parquet dataset.")
-
-            self.samples = samples
-
-        except Exception as e:
-            raise RuntimeError(f"ParquetDataset initialization failed: {e}")
+        if self.num_chunks <= 0:
+            raise ValueError("Dataset is too small for the configured max_length.")
 
     def __len__(self):
-        return len(self.samples)
+        return self.num_chunks
 
     def __getitem__(self, idx):
-        try:
-            chunk = self.samples[idx]
-            chunk = torch.tensor(chunk, dtype=torch.long)
-            return {
-                "input_ids": chunk[:-1],
-                "labels": chunk[1:]
-            }
-        except Exception as e:
-            raise RuntimeError(f"Failed to load sample {idx}: {e}")
+        if self.random_offset:
+            # randomize within chunk boundaries for more varied training
+            base = idx * self.stride
+            shift = np.random.randint(0, self.stride // 4 + 1)
+            start = min(base + shift, len(self.data) - self.max_length - 1)
+        else:
+            start = idx * self.stride
+
+        chunk = self.data[start : start + self.max_length + 1]
+
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+
+        return x, y
+
 
 class PreloadedDataset(Dataset):
     """Pre-load entire dataset in RAM for maximum speed (small datasets only)"""

@@ -30,7 +30,7 @@ from rich import box
 from models import Transformer
 from config import Config
 from finewebdataset import FineWebStreamingDataset, FineWebDataset
-from dataset import TextDataset, DataCollator, FileStreamingIterableDataset,DirectStreamingDataset,ParquetDataset
+from dataset import TextDataset, DataCollator, FileStreamingIterableDataset,DirectStreamingDataset,TokenBinDataset
 from optimizer import MuonClip, get_muon_param_groups
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -442,7 +442,7 @@ def main():
     atexit.register(cleanup_handler)
     
     parser = argparse.ArgumentParser(description='Train Nano KIMI K2 Model with MuonClip')
-    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local','localstreaming','hfstreaming'])
+    parser.add_argument('--dataset', type=str, default='local', choices=['fineweb', 'streaming', 'local','localstreaming','hfstreaming','tokenbin'])
     parser.add_argument('--hf_repo_name',type=str,default=None)
     parser.add_argument('--data_path', type=str, default='data/train.txt')
     parser.add_argument('--num_samples', type=int, default=10000)
@@ -530,16 +530,16 @@ def main():
                 hf_shuffle=True,
                 seed=42  
             )
-        elif args.dataset == 'parquet':
-            if args.hf_repo_name == None:
-                raise ValueError("Dataset name not provided use \'--hf_repo_name\' argument")
-            dataset = ParquetDataset(
-                file_path=args.data_path,
-                tokenizer=tokenizer,
-                max_length=config.max_seq_length,
-                stride=256,
-                num_proc=4
+        elif args.dataset == 'tokenbin':
+            if args.data_path == None:
+                raise ValueError("Argument --data_path must be provided")
+            dataset = TokenBinDataset(
+                bin_path=args.data_path,
+                max_length=1024,
+                stride=1024,  # no overlap
+                random_offset=True,  # adds natural dataset augmentation
             )
+
         else:
             dataset = TextDataset(
                 file_path=args.data_path,
