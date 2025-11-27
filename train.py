@@ -463,7 +463,7 @@ def main():
     parser.add_argument('--checkpoint_path', type=str, default=None)
     parser.add_argument('--val_from_train', action='store_true', default=False, help='Cache a few training batches on CPU and reuse as validation')
     parser.add_argument('--val_batches', type=int, default=8, help='Number of training batches to cache for validation')
-    
+    parser.add_argument('--num_workers', type=int, default=2)
     args = parser.parse_args()
     
     torch.manual_seed(42)
@@ -557,7 +557,7 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True if 'streaming' not in args.dataset else False,
-        num_workers=0 if 'streaming' not in args.dataset else 2,
+        num_workers=0 if 'streaming' in args.dataset else args.num_workers,
         pin_memory=torch.cuda.is_available(),
         collate_fn=collator,
         drop_last=True,
