@@ -28,7 +28,7 @@ This project implements a compact yet powerful language model architecture that 
 
 Due to the large file size, pre-trained model checkpoints are hosted on Google Drive:
 
-**[Download Pre-trained Checkpoint from Google Drive](https://drive.google.com/drive/folders/YOUR_FOLDER_ID)**
+**[Download Pre-trained Checkpoint from Google Drive](https://drive.google.com/drive/folders/19zbSPmPZ8i4Nhcha1YTUVY5-CZzknRNB?usp=sharing)**
 
 > 📝 **Note**: Place the downloaded checkpoint file (`.pt` format) in the `checkpoints/` directory before running inference.
 
