@@ -30,7 +30,7 @@ Due to the large file size, pre-trained model checkpoints are hosted on Google D
 
 **[Download Pre-trained Checkpoint from Google Drive](https://drive.google.com/drive/folders/19zbSPmPZ8i4Nhcha1YTUVY5-CZzknRNB?usp=sharing)**
 
-> 📝 **Note**: Place the downloaded checkpoint file (`.pt` format) in the `checkpoints/` directory before running inference.
+> 📝 **Note**: Place the downloaded checkpoint file (`.pt` format) in the `checkpoints/` directory before running inference. The current model output may not be fully coherent, as this is an early-stage/preliminary checkpoint :(
 
 ## 🚀 Quick Start
 
