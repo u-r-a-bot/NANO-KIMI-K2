@@ -14,7 +14,7 @@ This project implements a compact yet powerful language model architecture that 
 ## 📊 Model Specifications
 
 - **Parameters**: ~243M (243,263,104)
-- **Architecture**: 6 layers (1 dense + 5 MoE)
+- **Architecture**: 6 layers
 - **Embedding Dimension**: 896
 - **Attention Heads**: 8
 - **Vocabulary Size**: 49,152 (SmolLM tokenizer)
