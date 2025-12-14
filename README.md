@@ -44,7 +44,7 @@ Due to the large file size, pre-trained model checkpoints are hosted on Google D
 
 1. **Clone the repository:**
    ```bash
-   git clone [<repository-url>](https://github.com/u-r-a-bot/NANO-KIMI-K2.git)
+   git clone https://github.com/u-r-a-bot/NANO-KIMI-K2.git
    cd NANO-KIMI-K2-main
    ```
 
