@@ -301,7 +301,7 @@ Training generates:
 - Reduce `--batch_size`
 - Increase `--gradient_accumulation`
 - Use smaller `max_seq_length` in config
-- Enable gradient checkpointing (if implemented)
+- Enable gradient checkpointing
 
 ### Slow Training
 - Enable mixed precision (auto for CUDA)
