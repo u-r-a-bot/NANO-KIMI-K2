@@ -1,6 +1,6 @@
 # Efficient Transformer Language Model with Multi-Head Latent Attention
 
-A PyTorch implementation of an efficient transformer language model featuring Multi-Head Latent Attention (MLA) with KV compression and Mixture of Experts (MoE) architecture, optimized with the MuonClip optimizer for stable and efficient training.
+A PyTorch implementation of an efficient transformer language model featuring Multi-Head Latent Attention (MLA) with KV compression and Mixture of Experts (MoE) architecture, optimized with the MuonClip optimizer for stable and efficient training. 
 
 ## 🎯 Overview
 
