@@ -329,6 +329,8 @@ Please refer to the repository license file for license information.
 
 For issues, questions, or contributions, please open an issue or submit a pull request.
 
+## Ablation Studies
+Ablation studies were performed using different experimental setup. [Link](https://github.com/CODEX108/NANO-KIMI-K2-Ablation)
 ---
 
 **Happy Training! 🚀**
