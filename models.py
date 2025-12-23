@@ -388,15 +388,15 @@ class Transformer(nn.Module):
             elif isinstance(module, nn.Embedding):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, tokens: torch.Tensor, start_pos: int = 0, use_cache: bool = False):
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0,mask: Optional[torch.Tensor] = None, use_cache: bool = False):
         b, seqlen = tokens.shape
         h = self.embed(tokens)
         
         input_pos = torch.arange(start_pos, start_pos + seqlen, device=tokens.device)
         
         # Training (multi-token, no cache): use SDPA causal fast-path.
-        # Decoding with cache (usually 1 token): no mask and no is_causal (cache enforces causality).
-        mask = None
+
+        # mask = None
         use_is_causal = (seqlen > 1 and not use_cache)
         
         for layer in self.layers:
