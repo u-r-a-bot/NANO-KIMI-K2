@@ -58,7 +58,8 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         mixed_precision: bool = True,
-        qk_clip_tau: float = 100.0
+        qk_clip_tau: float = 100.0,
+        refresh_optimizer_state: bool = False
     ):
         self.model = model
         self.train_loader = train_loader
@@ -77,6 +78,7 @@ class Trainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
         self.qk_clip_tau = qk_clip_tau
+        self.refresh_optimizer_state = refresh_optimizer_state
         
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -154,11 +156,14 @@ class Trainer:
     
         self.model.load_state_dict(state_dict, strict=False)
     
-        try:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            console.print("[green]Optimizer state loaded[/green]")
-        except Exception as e:
-            console.print(f"[yellow]Optimizer load failed: {e}[/yellow]")
+        if not self.refresh_optimizer_state:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                console.print("[green]Optimizer state loaded[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Optimizer load failed: {e}[/yellow]")
+        else:
+            console.print("[yellow]Skipping optimizer state load (refreshing optimizer state)[/yellow]")
     
         self.global_step = checkpoint.get("global_step", 0)
         self.epoch = checkpoint.get("epoch", 0)
@@ -464,6 +469,7 @@ def main():
     parser.add_argument('--val_from_train', action='store_true', default=False, help='Cache a few training batches on CPU and reuse as validation')
     parser.add_argument('--val_batches', type=int, default=8, help='Number of training batches to cache for validation')
     parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--refresh_optimizer_state', action='store_true', default=False, help='Skip loading optimizer state from checkpoint to refresh it')
     args = parser.parse_args()
     
     torch.manual_seed(42)
@@ -619,7 +625,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         max_grad_norm=args.max_grad_norm,
         mixed_precision=args.mixed_precision,
-        qk_clip_tau=args.qk_clip_tau
+        qk_clip_tau=args.qk_clip_tau,
+        refresh_optimizer_state=args.refresh_optimizer_state
     )
     
     if args.resume:
